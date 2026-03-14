@@ -1,3 +1,6 @@
 /dataset
 /.venv
 *.csv
+*.tflite
+*.json
+*.keras

@@ -90,7 +90,7 @@ PERCLOS_EAR_Z_THRESHOLD = -0.25
 SAVGOL_WINDOW = 7
 SAVGOL_POLY = 2
 
-SEQ_LEN = 90                               # 3 s at 30 fps
+SEQ_LEN = 90                              # 3 s at 30 fps
 TRAIN_STEP = 15
 EVAL_STEP = 30
 
@@ -139,13 +139,14 @@ USE_SWA = False                             # SWA disabled to avoid EarlyStoppin
 MIXUP_FRACTION = 0.35                       # in-place mixup on subset to limit memory
 MIXUP_CHUNK = 16384                         # chunk size for memory-safe in-place mixup
 
-F_BETA = 2.0
-N_FOLDS = 5
-SKIP_CV = False
+F_BETA = 1
+FIXED_THRESHOLD = None                    # set float in [0,1] to force threshold
+N_FOLDS = 3
+SKIP_CV = True
 SEED = 42
 DETERMINISTIC = False
 
-ES_PATIENCE = 25                            # increased to survive LR warm restarts
+ES_PATIENCE = 2                            # increased to survive LR warm restarts
 
 MODEL_NAME = "drowsiness_mv3_lstm"
 
@@ -420,6 +421,16 @@ def find_optimal_threshold(y_true, y_prob, f_beta=F_BETA):
         if fb > best_score:
             best_score, best_thr = fb, thr
     return float(best_thr)
+
+
+def resolve_threshold(y_true, y_prob, fixed_threshold=FIXED_THRESHOLD):
+    """Return fixed threshold if configured, else F-beta-optimal threshold."""
+    if fixed_threshold is not None:
+        thr = float(fixed_threshold)
+        if not (0.0 <= thr <= 1.0):
+            raise ValueError(f"FIXED_THRESHOLD must be in [0, 1], got {thr}")
+        return thr
+    return find_optimal_threshold(y_true, y_prob)
 
 
 # ─────────────────────────── Model ───────────────────────────────────────
@@ -791,7 +802,7 @@ def run_cross_validation(df):
         tta_rng = np.random.default_rng(SEED + fold + 200)
         y_prob = predict_with_tta(model, X_te, rng=tta_rng)
         y_val_prob = predict_with_tta(model, X_val, rng=tta_rng)
-        thr = find_optimal_threshold(y_val, y_val_prob)
+        thr = resolve_threshold(y_val, y_val_prob)
 
         y_pred = (y_prob >= thr).astype(int)
         y_pred_d = (y_prob >= 0.5).astype(int)
@@ -970,18 +981,55 @@ def train_final_model(df):
     X_thr, y_thr = create_sequences(
         df_thr, SEQ_LEN, EVAL_STEP, temporal_pad=TEMPORAL_PAD)
     print(f"  Threshold holdout: {len(X_thr):,} sequences")
+    y_thr_prob = None
 
-    if len(X_thr) == 0:
+    if FIXED_THRESHOLD is not None:
+        opt_thr = resolve_threshold(np.array([0, 1]), np.array([0.0, 1.0]))
+        print("  Deployment threshold: fixed via FIXED_THRESHOLD")
+    elif len(X_thr) == 0:
         print("  WARNING: threshold holdout has 0 sequences; using default threshold=0.5")
         opt_thr = 0.5
     else:
         tta_rng = np.random.default_rng(SEED + 999)
         y_thr_prob = predict_with_tta(model, X_thr, rng=tta_rng)
-        opt_thr = find_optimal_threshold(y_thr, y_thr_prob)
+        opt_thr = resolve_threshold(y_thr, y_thr_prob)
     print(f"  Deployment threshold: {opt_thr:.3f}")
+
+    # Final post-training metrics
+    print("\n--- Final Model Metrics ---")
+    val_rng = np.random.default_rng(SEED + 1001)
+    y_val_prob = predict_with_tta(model, X_val, rng=val_rng)
+    y_val_pred = (y_val_prob >= opt_thr).astype(int)
+    val_auc = roc_auc_score(y_val, y_val_prob) if len(np.unique(y_val)) > 1 else 0.0
+    print(f"  Validation @thr={opt_thr:.3f}")
+    print(f"    Acc:  {accuracy_score(y_val, y_val_pred):.4f}")
+    print(f"    F1:   {f1_score(y_val, y_val_pred, zero_division=0):.4f}")
+    print(f"    AUC:  {val_auc:.4f}")
+    print(f"    Prec: {precision_score(y_val, y_val_pred, zero_division=0):.4f}")
+    print(f"    Rec:  {recall_score(y_val, y_val_pred, zero_division=0):.4f}")
+    print(f"    CM:\n{confusion_matrix(y_val, y_val_pred)}")
+    print(classification_report(y_val, y_val_pred,
+                                target_names=["Alert", "Drowsy"]))
+
+    if len(X_thr) > 0:
+        if y_thr_prob is None:
+            thr_rng = np.random.default_rng(SEED + 1002)
+            y_thr_prob = predict_with_tta(model, X_thr, rng=thr_rng)
+        y_thr_pred = (y_thr_prob >= opt_thr).astype(int)
+        thr_auc = roc_auc_score(y_thr, y_thr_prob) if len(np.unique(y_thr)) > 1 else 0.0
+        print(f"  Threshold-holdout @thr={opt_thr:.3f}")
+        print(f"    Acc:  {accuracy_score(y_thr, y_thr_pred):.4f}")
+        print(f"    F1:   {f1_score(y_thr, y_thr_pred, zero_division=0):.4f}")
+        print(f"    AUC:  {thr_auc:.4f}")
+        print(f"    Prec: {precision_score(y_thr, y_thr_pred, zero_division=0):.4f}")
+        print(f"    Rec:  {recall_score(y_thr, y_thr_pred, zero_division=0):.4f}")
+        print(f"    CM:\n{confusion_matrix(y_thr, y_thr_pred)}")
+        print(classification_report(y_thr, y_thr_pred,
+                                    target_names=["Alert", "Drowsy"]))
 
     deploy_cfg = {
         "threshold": opt_thr,
+        "fixed_threshold": FIXED_THRESHOLD,
         "sequence_length": SEQ_LEN,
         "num_raw_features": NUM_RAW,
         "num_features": NUM_FEATURES,
