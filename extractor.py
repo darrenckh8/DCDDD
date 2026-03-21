@@ -53,16 +53,27 @@ VIDEO_EXTS = {".mov", ".mp4", ".avi", ".mkv", ".m4v"}
 # Regex to parse stems like "0", "10", "10_1", "0_2"
 _STEM_RE = re.compile(r'^(0|10)(?:_(\d+))?$')
 
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"  [WARN] Invalid {name}={raw!r}; using {default}")
+        val = int(default)
+    return max(minimum, val)
+
 CPU_COUNT = max(1, os.cpu_count() or 1)
-NUM_WORKERS = int(os.environ.get("EXTRACTOR_WORKERS", str(CPU_COUNT)))
-NUM_WORKERS = max(1, NUM_WORKERS)
-MAX_GAP_FILL = max(0, int(os.environ.get("EXTRACTOR_MAX_GAP_FILL", "15")))
+NUM_WORKERS = _env_int("EXTRACTOR_WORKERS", CPU_COUNT, 1)
+MAX_GAP_FILL = _env_int("EXTRACTOR_MAX_GAP_FILL", 15, 0)
 
 # Worker/runtime performance controls.
 EXTRACTOR_MP_DELEGATE = os.environ.get("EXTRACTOR_MP_DELEGATE", "auto").strip().lower()
-EXTRACTOR_WORKER_THREADS = max(1, int(os.environ.get("EXTRACTOR_WORKER_THREADS", "1")))
-EXTRACTOR_OMP_THREADS = max(1, int(os.environ.get("EXTRACTOR_OMP_THREADS", str(EXTRACTOR_WORKER_THREADS))))
-EXTRACTOR_CHUNKS_PER_WORKER = max(1, int(os.environ.get("EXTRACTOR_CHUNKS_PER_WORKER", "4")))
+EXTRACTOR_WORKER_THREADS = _env_int("EXTRACTOR_WORKER_THREADS", 1, 1)
+EXTRACTOR_OMP_THREADS = _env_int("EXTRACTOR_OMP_THREADS", EXTRACTOR_WORKER_THREADS, 1)
+EXTRACTOR_CHUNKS_PER_WORKER = _env_int("EXTRACTOR_CHUNKS_PER_WORKER", 4, 1)
 
 # MediaPipe FaceMesh
 MP_DET_CONF = 0.5
@@ -211,8 +222,6 @@ def _fill_feature_gaps(features):
             limit_area='inside',
         )
         df_feat = df_feat.ffill(limit=MAX_GAP_FILL).bfill(limit=MAX_GAP_FILL)
-    else:
-        df_feat = df_feat.ffill().bfill()
     df_feat = df_feat.fillna(0.0)
 
     # Prevent ±180° wrap discontinuities from appearing as large fake jumps.
@@ -297,6 +306,19 @@ def _init_worker(
 
     atexit.register(_close_worker_resources)
 
+
+def _detect_for_video_with_retry(landmarker, mp_image, ts_ms: int):
+    """Retry once with a bumped timestamp if MediaPipe rejects monotonicity."""
+    global _WORKER_TS_MS
+    try:
+        return landmarker.detect_for_video(mp_image, ts_ms), ts_ms
+    except Exception as exc:
+        if "monotonically increasing" not in str(exc):
+            raise
+        retry_ts = max(int(_WORKER_TS_MS) + 1, int(ts_ms) + 1)
+        result = landmarker.detect_for_video(mp_image, retry_ts)
+        return result, retry_ts
+
 def extract_video(video_paths, subject_id, label, video_file_key):
     """Extract per-frame features from one (possibly multi-part) video.
 
@@ -335,7 +357,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             ts_ms = int(timestamp_ms)
-            result = landmarker.detect_for_video(mp_image, ts_ms)
+            result, ts_used = _detect_for_video_with_retry(landmarker, mp_image, ts_ms)
 
             if result.face_landmarks:
                 fl = result.face_landmarks[0]
@@ -364,7 +386,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
                 features.append([np.nan] * 10)
 
             fidx += 1
-            _WORKER_TS_MS = ts_ms
+            _WORKER_TS_MS = int(ts_used)
             timestamp_ms += frame_step_ms
             if int(timestamp_ms) <= _WORKER_TS_MS:
                 timestamp_ms = float(_WORKER_TS_MS + 1)

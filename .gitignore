@@ -4,3 +4,4 @@
 *.tflite
 *.json
 *.keras
+.DS_Store

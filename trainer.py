@@ -3,6 +3,7 @@ import json
 import shutil
 import time
 import warnings
+import re
 
 CPU_COUNT = max(1, os.cpu_count() or 1)
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "1")
@@ -27,8 +28,25 @@ try:
 except ImportError:
     _HAS_SCIPY = False
 
-tf.config.threading.set_inter_op_parallelism_threads(CPU_COUNT)
-tf.config.threading.set_intra_op_parallelism_threads(CPU_COUNT)
+
+def _tf_version_at_least(major: int, minor: int) -> bool:
+    m = re.match(r"^\s*(\d+)\.(\d+)", str(tf.__version__))
+    if not m:
+        return False
+    cur = (int(m.group(1)), int(m.group(2)))
+    return cur >= (major, minor)
+
+
+_USE_STRING_HARD_ACTS = _tf_version_at_least(2, 13)
+HARD_SWISH_ACT = "hard_swish" if _USE_STRING_HARD_ACTS else tf.nn.hard_swish
+HARD_SIGMOID_ACT = "hard_sigmoid" if _USE_STRING_HARD_ACTS else tf.keras.activations.hard_sigmoid
+
+try:
+    tf.config.threading.set_inter_op_parallelism_threads(CPU_COUNT)
+    tf.config.threading.set_intra_op_parallelism_threads(CPU_COUNT)
+except RuntimeError as exc:
+    # This can happen if TensorFlow runtime was already initialized upstream.
+    print(f"WARNING: unable to set TF thread pools at import time: {exc}")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -36,6 +54,18 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"WARNING: invalid {name}={raw!r}; using {default}")
+        val = int(default)
+    return max(minimum, val)
 
 
 def _configure_tf_runtime() -> dict:
@@ -62,6 +92,9 @@ def _configure_tf_runtime() -> dict:
         policy = "mixed_float16"
     else:  # auto
         policy = "mixed_float16" if gpus else "float32"
+    if not gpus and policy == "mixed_float16":
+        print("WARNING: mixed_float16 requested without a GPU; falling back to float32")
+        policy = "float32"
     mixed_precision.set_global_policy(policy)
 
     if len(gpus) > 1:
@@ -75,9 +108,10 @@ def _configure_tf_runtime() -> dict:
         strategy_name = "OneDeviceStrategy(CPU)"
 
     replicas = int(strategy.num_replicas_in_sync)
-    runtime_batch = max(
+    runtime_batch = _env_int(
+        "TRAINER_RUNTIME_BATCH_SIZE",
+        BATCH_SIZE * max(replicas, 1),
         1,
-        int(os.environ.get("TRAINER_RUNTIME_BATCH_SIZE", str(BATCH_SIZE * max(replicas, 1)))),
     )
 
     return {
@@ -123,10 +157,11 @@ PERCLOS_EAR_Z_THRESHOLD = -0.25
 SAVGOL_WINDOW = 7
 SAVGOL_POLY   = 2
 
-# Savitzky-Golay is symmetric (uses future context). To avoid lookahead
-# leakage in validation/test/report metrics, keep it train-only by default.
-SAVGOL_ON_TRAIN = True
-SAVGOL_ON_EVAL  = False
+# Keep preprocessing consistent between train/eval. Default is disabled to
+# avoid lookahead leakage from symmetric Savitzky-Golay windows.
+SAVGOL_ENABLED  = False
+SAVGOL_ON_TRAIN = SAVGOL_ENABLED
+SAVGOL_ON_EVAL  = SAVGOL_ENABLED
 
 SEQ_LEN    = 150  # 5 s at 30 fps
 TRAIN_STEP = 20
@@ -384,13 +419,14 @@ def apply_savgol(df: pd.DataFrame, enabled: bool = True, tag: str = "") -> pd.Da
         print("  WARNING: scipy missing — skipping Savitzky-Golay denoising")
         return df
     parts = []
-    for _, grp in df.groupby("Video_File"):
+    for _, grp in df.groupby(["Subject", "Video_File"], sort=False):
         g = grp.copy()
         if len(g) >= SAVGOL_WINDOW:
             for feat in FEATURES:
                 g[feat] = _savgol(g[feat].values, SAVGOL_WINDOW, SAVGOL_POLY)
         parts.append(g)
-    return pd.concat(parts)
+    out = pd.concat(parts)
+    return out.sort_values(["Subject", "Video_File", "Frame"]).reset_index(drop=True)
 
 
 # ─────────────────────────── Feature Engineering ─────────────────────────
@@ -400,11 +436,9 @@ def apply_enhanced_features(X_raw: np.ndarray) -> np.ndarray:
     """(N, T, 10) → (N, T, 33): raw + Δ + ΔΔ + [EAR-var, head-move, PERCLOS]."""
     N, T, _ = X_raw.shape
 
-    # Unwrap Euler angles (pitch/yaw/roll) along time to avoid ±180° wrap
-    # artifacts turning into unrealistically large deltas.
+    # Angle unwrapping is handled during extraction (before normalisation),
+    # so these values are already in consistent units for temporal deltas.
     X_proc = X_raw.astype(np.float32, copy=True)
-    ang = X_proc[:, :, 7:10].astype(np.float64)
-    X_proc[:, :, 7:10] = np.rad2deg(np.unwrap(np.deg2rad(ang), axis=1)).astype(np.float32)
 
     delta = np.zeros_like(X_proc)
     delta[:, 1:] = X_proc[:, 1:] - X_proc[:, :-1]
@@ -455,11 +489,12 @@ def _create_raw_sequences(
     padded_len = seq_len + temporal_pad
     X, y = [], []
     groups = []
-    for video_file, grp in df.groupby("Video_File"):
+    for (subject, video_file), grp in df.groupby(["Subject", "Video_File"], sort=False):
         raw    = grp[FEATURES].values.astype(np.float32)
         labels = grp["Label"].values
         if len(raw) < seq_len:
             continue
+        group_id = f"{subject}|{video_file}"
         for i in range(0, len(raw) - seq_len + 1, step):
             ps    = max(0, i - temporal_pad)
             chunk = raw[ps : i + seq_len]
@@ -468,7 +503,7 @@ def _create_raw_sequences(
                 chunk = np.pad(chunk, ((pad_n, 0), (0, 0)), mode="edge")
             X.append(chunk)
             y.append(labels[i + seq_len - 1])
-            groups.append(video_file)
+            groups.append(group_id)
     if not X:
         empty_X = np.empty((0, padded_len, NUM_RAW), dtype=np.float32)
         empty_y = np.empty((0,), dtype=np.int32)
@@ -589,6 +624,38 @@ def _apply_inplace_mixup(
     return X, y
 
 
+def _apply_mixup_with_global_partners(
+    X: np.ndarray,
+    y: np.ndarray,
+    X_raw_pool: np.ndarray,
+    y_pool: np.ndarray,
+    rng: np.random.Generator,
+    temporal_pad: int = 0,
+    alpha: float = MIXUP_ALPHA,
+    fraction: float = MIXUP_FRACTION,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mix a subset of the batch with partners sampled from the full dataset."""
+    n = len(X)
+    pool_n = len(X_raw_pool)
+    if n < 1 or pool_n < 1 or fraction <= 0.0:
+        return X, y
+
+    k = max(1, int(n * fraction))
+    tgt = rng.choice(n, size=k, replace=False)
+    partner_idx = rng.integers(0, pool_n, size=k)
+
+    X_partner = apply_enhanced_features(X_raw_pool[partner_idx])
+    if temporal_pad > 0:
+        X_partner = X_partner[:, temporal_pad:, :]
+    X_partner = np.ascontiguousarray(X_partner, dtype=np.float32)
+    y_partner = np.ascontiguousarray(y_pool[partner_idx].astype(np.float32), dtype=np.float32)
+
+    lam = rng.beta(alpha, alpha, (k, 1, 1)).astype(np.float32)
+    X[tgt] = lam * X[tgt] + (1.0 - lam) * X_partner
+    y[tgt] = lam.reshape(-1) * y[tgt] + (1.0 - lam.reshape(-1)) * y_partner
+    return X, y
+
+
 def build_augmented_dataset(
     X_raw: np.ndarray,
     y: np.ndarray,
@@ -633,7 +700,12 @@ def build_augmented_dataset(
 
 
 class AugmentedSequence(keras.utils.Sequence):
-    """On-the-fly augmentation + feature engineering to keep memory bounded."""
+    """On-the-fly augmentation + feature engineering to keep memory bounded.
+
+    Not multiprocessing-safe: this class keeps mutable epoch state
+    (`_epoch_seed`, `_sample_idx`, `_round_ids`) and should be used with
+    `use_multiprocessing=False`.
+    """
 
     def __init__(
         self,
@@ -693,11 +765,13 @@ class AugmentedSequence(keras.utils.Sequence):
 
         X_feat = np.ascontiguousarray(X_feat, dtype=np.float32)
         y_batch = np.ascontiguousarray(y_batch, dtype=np.float32)
-        X_feat, y_batch = _apply_inplace_mixup(
+        X_feat, y_batch = _apply_mixup_with_global_partners(
             X_feat,
             y_batch,
+            self.X_raw,
+            self.y,
             rng,
-            chunk_size=max(len(X_feat), 1),
+            temporal_pad=self.temporal_pad,
         )
         return X_feat, y_batch
 
@@ -830,7 +904,7 @@ def _mbconv1d(x, expand, out, kernel, stride, use_se, use_hs, name="mb"):
                                 kernel_initializer="he_normal", name=f"{name}_exp")(x)
         h = keras.layers.BatchNormalization(name=f"{name}_exp_bn")(h)
         if use_hs:
-            h = keras.layers.Activation("hard_swish", name=f"{name}_exp_act")(h)
+            h = keras.layers.Activation(HARD_SWISH_ACT, name=f"{name}_exp_act")(h)
         else:
             h = keras.layers.ReLU(name=f"{name}_exp_act")(h)
     else:
@@ -842,7 +916,7 @@ def _mbconv1d(x, expand, out, kernel, stride, use_se, use_hs, name="mb"):
                             kernel_initializer="he_normal", name=f"{name}_dw")(h)
     h = keras.layers.BatchNormalization(name=f"{name}_dw_bn")(h)
     if use_hs:
-        h = keras.layers.Activation("hard_swish", name=f"{name}_dw_act")(h)
+        h = keras.layers.Activation(HARD_SWISH_ACT, name=f"{name}_dw_act")(h)
     else:
         h = keras.layers.ReLU(name=f"{name}_dw_act")(h)
 
@@ -853,7 +927,7 @@ def _mbconv1d(x, expand, out, kernel, stride, use_se, use_hs, name="mb"):
         se  = keras.layers.Dense(mid, activation="relu",
                                  kernel_initializer="he_normal", name=f"{name}_se_r")(se)
         se  = keras.layers.Dense(expand, kernel_initializer="he_normal", name=f"{name}_se_e")(se)
-        se  = keras.layers.Activation("hard_sigmoid", name=f"{name}_se_hs")(se)
+        se  = keras.layers.Activation(HARD_SIGMOID_ACT, name=f"{name}_se_hs")(se)
         h   = keras.layers.Multiply(name=f"{name}_se_m")([h, se])
 
     # Project (linear bottleneck — no activation)
@@ -891,7 +965,7 @@ def build_model(seq_len: int = SEQ_LEN, num_features: int = NUM_FEATURES) -> ker
     x = keras.layers.Conv1D(STEM_FILTERS, 3, padding="same", use_bias=False,
                             kernel_initializer="he_normal", name="stem_conv")(inp)
     x = keras.layers.BatchNormalization(name="stem_bn")(x)
-    x = keras.layers.Activation("hard_swish", name="stem_act")(x)
+    x = keras.layers.Activation(HARD_SWISH_ACT, name="stem_act")(x)
 
     # MobileNetV3 inverted residual blocks
     for i, (exp, out, ks, s, se, hs) in enumerate(MBCONV_CONFIG):
@@ -901,7 +975,7 @@ def build_model(seq_len: int = SEQ_LEN, num_features: int = NUM_FEATURES) -> ker
     x = keras.layers.Conv1D(NECK_DIM, 1, use_bias=False,
                             kernel_initializer="he_normal", name="neck_conv")(x)
     x = keras.layers.BatchNormalization(name="neck_bn")(x)
-    x = keras.layers.Activation("hard_swish", name="neck_act")(x)
+    x = keras.layers.Activation(HARD_SWISH_ACT, name="neck_act")(x)
 
     # recurrent_dropout=0.1 regularises hidden-to-hidden paths.
     # unroll=True keeps TFLite compatibility.
@@ -920,7 +994,7 @@ def build_model(seq_len: int = SEQ_LEN, num_features: int = NUM_FEATURES) -> ker
     x   = keras.layers.Dense(128, use_bias=False,
                               kernel_initializer="he_normal", name="head_fc1")(x)
     x   = keras.layers.BatchNormalization(name="head_bn1")(x)
-    x   = keras.layers.Activation("hard_swish", name="head_act")(x)
+    x   = keras.layers.Activation(HARD_SWISH_ACT, name="head_act")(x)
     x   = keras.layers.Dropout(DROPOUT, name="head_drop1")(x)
     x   = keras.layers.Dense(64, activation="relu",
                               kernel_initializer="he_normal", name="head_fc2")(x)
@@ -956,6 +1030,30 @@ def cosine_lr_schedule(epoch: int, _lr: float = None) -> float:
     return minimum + 0.5 * (peak - minimum) * (1 + np.cos(np.pi * progress))
 
 
+class HardBinaryAccuracy(keras.metrics.Metric):
+    """BinaryAccuracy with hard-thresholded labels for MixUp-style soft targets."""
+
+    def __init__(self, name: str = "hard_accuracy", threshold: float = 0.5, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.threshold = float(threshold)
+        self._inner = keras.metrics.BinaryAccuracy(threshold=self.threshold)
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_hard = tf.cast(y_true >= 0.5, y_pred.dtype)
+        return self._inner.update_state(y_true_hard, y_pred, sample_weight=sample_weight)
+
+    def result(self):
+        return self._inner.result()
+
+    def reset_state(self):
+        self._inner.reset_state()
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"threshold": self.threshold})
+        return cfg
+
+
 def compile_model(model: keras.Model, focal_alpha: float = FOCAL_ALPHA) -> keras.Model:
     """Compile with data-driven focal alpha and class balancing enabled."""
     model.compile(
@@ -971,7 +1069,7 @@ def compile_model(model: keras.Model, focal_alpha: float = FOCAL_ALPHA) -> keras
             from_logits=False,
         ),
         metrics=[
-            keras.metrics.BinaryAccuracy(name="hard_accuracy", threshold=0.5),
+            HardBinaryAccuracy(name="hard_accuracy", threshold=0.5),
             keras.metrics.AUC(name="auc"),
             keras.metrics.Precision(name="precision"),
             keras.metrics.Recall(name="recall"),
@@ -1065,7 +1163,12 @@ def run_cross_validation(df: pd.DataFrame) -> list:
 
         rng_split = np.random.default_rng(SEED + fold)
 
-        n_val      = max(2, len(train_subj) // 10)
+        if len(train_subj) < 2:
+            print("  SKIP: not enough training subjects to create a validation split")
+            tf.keras.backend.clear_session()
+            continue
+        n_val = max(1, len(train_subj) // 10)
+        n_val = min(n_val, len(train_subj) - 1)
         val_subj   = rng_split.choice(train_subj, n_val, replace=False)
         act_train  = np.array([s for s in train_subj if s not in val_subj])
 
@@ -1118,12 +1221,9 @@ def run_cross_validation(df: pd.DataFrame) -> list:
             model.summary()
 
         ckpt_path = os.path.join(BASE_DIR, f"_fold{fold}_ckpt.weights.h5")
-        val_ds = (
-            tf.data.Dataset.from_tensor_slices((X_val, y_val))
-            .batch(RUNTIME_BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-        model.fit(train_seq, validation_data=val_ds, epochs=EPOCHS,
+        # Keep default single-process generator consumption. AugmentedSequence
+        # has mutable epoch state and is not safe with use_multiprocessing=True.
+        model.fit(train_seq, validation_data=(X_val, y_val), epochs=EPOCHS,
                   callbacks=get_callbacks(ckpt_path), verbose=1)
 
         if os.path.exists(ckpt_path):
@@ -1284,13 +1384,9 @@ def train_final_model(df: pd.DataFrame) -> None:
     model.summary()
 
     ckpt_path = os.path.join(BASE_DIR, "_final_ckpt.weights.h5")
-    val_ds = (
-        tf.data.Dataset.from_tensor_slices((X_val, y_val))
-        .batch(RUNTIME_BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-
-    model.fit(train_seq, validation_data=val_ds, epochs=EPOCHS,
+    # Keep default single-process generator consumption. AugmentedSequence
+    # has mutable epoch state and is not safe with use_multiprocessing=True.
+    model.fit(train_seq, validation_data=(X_val, y_val), epochs=EPOCHS,
               callbacks=get_callbacks(ckpt_path), verbose=1)
 
     if os.path.exists(ckpt_path):
@@ -1501,7 +1597,7 @@ def main() -> None:
         tf.config.experimental.enable_op_determinism()
 
     print("\nLoading data...")
-    df = sanitize_features(load_data(CSV_FILE), tag="raw input")
+    df = load_data(CSV_FILE)
 
     if not SKIP_CV:
         print("\n" + "=" * 60)
