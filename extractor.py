@@ -111,6 +111,7 @@ DIST_COEFFS = np.zeros((4, 1), dtype=np.float64)
 # Worker-local resources (one landmarker reused across many videos in process).
 _WORKER_LANDMARKER = None
 _WORKER_DELEGATE = "cpu"
+_WORKER_TS_MS = 0
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +227,11 @@ def _fill_feature_gaps(features):
 # ---------------------------------------------------------------------------
 
 def _close_worker_resources():
-    global _WORKER_LANDMARKER
+    global _WORKER_LANDMARKER, _WORKER_TS_MS
     if _WORKER_LANDMARKER is not None:
         _WORKER_LANDMARKER.close()
         _WORKER_LANDMARKER = None
+    _WORKER_TS_MS = 0
 
 
 def _create_landmarker_with_delegate(delegate_name: str):
@@ -301,7 +303,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
     video_paths: list of file-path strings (sorted by part number).
     Returns a list of row-tuples matching COLUMNS.
     """
-    global _WORKER_LANDMARKER
+    global _WORKER_LANDMARKER, _WORKER_TS_MS
     if _WORKER_LANDMARKER is None:
         _init_worker()
     landmarker = _WORKER_LANDMARKER
@@ -309,7 +311,10 @@ def extract_video(video_paths, subject_id, label, video_file_key):
     features = []      # list of 10-element lists (or NaN list)
     n_detected = 0
     fidx = 0
-    timestamp_ms = 0.0
+    # MediaPipe VIDEO mode requires strictly increasing timestamps for the
+    # lifetime of a landmarker instance. Because we reuse one instance per
+    # worker, continue timestamps across videos handled by this worker.
+    timestamp_ms = float(_WORKER_TS_MS + 1)
 
     # Iterate over all parts (usually just one)
     for part_path in video_paths:
@@ -329,7 +334,8 @@ def extract_video(video_paths, subject_id, label, video_file_key):
             h_cur, w_cur = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(mp_image, int(timestamp_ms))
+            ts_ms = int(timestamp_ms)
+            result = landmarker.detect_for_video(mp_image, ts_ms)
 
             if result.face_landmarks:
                 fl = result.face_landmarks[0]
@@ -358,7 +364,10 @@ def extract_video(video_paths, subject_id, label, video_file_key):
                 features.append([np.nan] * 10)
 
             fidx += 1
+            _WORKER_TS_MS = ts_ms
             timestamp_ms += frame_step_ms
+            if int(timestamp_ms) <= _WORKER_TS_MS:
+                timestamp_ms = float(_WORKER_TS_MS + 1)
 
         cap.release()
 
