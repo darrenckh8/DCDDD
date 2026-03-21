@@ -26,6 +26,8 @@ Usage:
 import os
 import re
 import time
+import csv
+import atexit
 
 import cv2
 import numpy as np
@@ -33,7 +35,7 @@ import pandas as pd
 import mediapipe as mp
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,13 @@ _STEM_RE = re.compile(r'^(0|10)(?:_(\d+))?$')
 CPU_COUNT = max(1, os.cpu_count() or 1)
 NUM_WORKERS = int(os.environ.get("EXTRACTOR_WORKERS", str(CPU_COUNT)))
 NUM_WORKERS = max(1, NUM_WORKERS)
+MAX_GAP_FILL = max(0, int(os.environ.get("EXTRACTOR_MAX_GAP_FILL", "15")))
+
+# Worker/runtime performance controls.
+EXTRACTOR_MP_DELEGATE = os.environ.get("EXTRACTOR_MP_DELEGATE", "auto").strip().lower()
+EXTRACTOR_WORKER_THREADS = max(1, int(os.environ.get("EXTRACTOR_WORKER_THREADS", "1")))
+EXTRACTOR_OMP_THREADS = max(1, int(os.environ.get("EXTRACTOR_OMP_THREADS", str(EXTRACTOR_WORKER_THREADS))))
+EXTRACTOR_CHUNKS_PER_WORKER = max(1, int(os.environ.get("EXTRACTOR_CHUNKS_PER_WORKER", "4")))
 
 # MediaPipe FaceMesh
 MP_DET_CONF = 0.5
@@ -97,6 +106,11 @@ MODEL_3D = np.array([
 ], dtype=np.float64)
 
 DIST_COEFFS = np.zeros((4, 1), dtype=np.float64)
+
+
+# Worker-local resources (one landmarker reused across many videos in process).
+_WORKER_LANDMARKER = None
+_WORKER_DELEGATE = "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -178,30 +192,57 @@ def compute_head_pose(lm, frame_w, frame_h):
     return pitch, yaw, roll
 
 
+def _safe_part_fps(cap):
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 1e-6:
+        return 30.0
+    return fps
+
+
+def _fill_feature_gaps(features):
+    """Interpolate short detector dropouts; leave long gaps obvious."""
+    df_feat = pd.DataFrame(features, columns=FEATURE_NAMES, dtype=np.float64)
+    if MAX_GAP_FILL > 0:
+        df_feat = df_feat.interpolate(
+            method='linear',
+            limit=MAX_GAP_FILL,
+            limit_direction='both',
+            limit_area='inside',
+        )
+        df_feat = df_feat.ffill(limit=MAX_GAP_FILL).bfill(limit=MAX_GAP_FILL)
+    else:
+        df_feat = df_feat.ffill().bfill()
+    df_feat = df_feat.fillna(0.0)
+
+    # Prevent ±180° wrap discontinuities from appearing as large fake jumps.
+    ang_cols = ["Pitch", "Yaw", "Roll"]
+    ang = df_feat[ang_cols].to_numpy(dtype=np.float64, copy=True)
+    df_feat.loc[:, ang_cols] = np.rad2deg(np.unwrap(np.deg2rad(ang), axis=0))
+    return df_feat
+
+
 # ---------------------------------------------------------------------------
 # Per-video extraction  (runs in worker process)
 # ---------------------------------------------------------------------------
 
-def extract_video(video_paths, subject_id, label, video_file_key):
-    """Extract per-frame features from one (possibly multi-part) video.
+def _close_worker_resources():
+    global _WORKER_LANDMARKER
+    if _WORKER_LANDMARKER is not None:
+        _WORKER_LANDMARKER.close()
+        _WORKER_LANDMARKER = None
 
-    video_paths: list of file-path strings (sorted by part number).
-    Returns a list of row-tuples matching COLUMNS.
-    """
-    # Prevent OpenCV from spawning internal threads (we parallelise at process level)
-    cv2.setNumThreads(1)
 
-    # Probe resolution from first part
-    probe = cv2.VideoCapture(video_paths[0])
-    if not probe.isOpened():
-        print(f"  [ERROR] Cannot open: {video_paths[0]}")
-        return []
-    W = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    probe.release()
+def _create_landmarker_with_delegate(delegate_name: str):
+    delegate_name = delegate_name.lower()
+    if delegate_name == "gpu":
+        delegate = mp.tasks.BaseOptions.Delegate.GPU
+    elif delegate_name == "cpu":
+        delegate = mp.tasks.BaseOptions.Delegate.CPU
+    else:
+        raise ValueError(f"Unsupported delegate: {delegate_name}")
 
     options = mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH, delegate=delegate),
         running_mode=mp.tasks.vision.RunningMode.VIDEO,
         num_faces=1,
         min_face_detection_confidence=MP_DET_CONF,
@@ -210,7 +251,60 @@ def extract_video(video_paths, subject_id, label, video_file_key):
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
-    landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+    return mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+
+def _init_worker(
+    delegate_mode: str | None = None,
+    cv_threads: int | None = None,
+    omp_threads: int | None = None,
+):
+    """Initialise heavy worker-local resources once per process."""
+    global _WORKER_LANDMARKER, _WORKER_DELEGATE
+
+    cv_threads = EXTRACTOR_WORKER_THREADS if cv_threads is None else max(1, int(cv_threads))
+    omp_threads = EXTRACTOR_OMP_THREADS if omp_threads is None else max(1, int(omp_threads))
+    cv2.setNumThreads(cv_threads)
+    os.environ["OMP_NUM_THREADS"] = str(omp_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(omp_threads)
+    os.environ["MKL_NUM_THREADS"] = str(omp_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(omp_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(omp_threads)
+
+    prefer = EXTRACTOR_MP_DELEGATE if delegate_mode is None else delegate_mode.strip().lower()
+    if prefer not in {"auto", "cpu", "gpu"}:
+        print(f"  [WARN] Unknown EXTRACTOR_MP_DELEGATE={prefer!r}; using auto")
+        prefer = "auto"
+
+    delegate_order = ["gpu", "cpu"] if prefer == "auto" else [prefer]
+    last_err = None
+    for delegate_name in delegate_order:
+        try:
+            _WORKER_LANDMARKER = _create_landmarker_with_delegate(delegate_name)
+            _WORKER_DELEGATE = delegate_name
+            if prefer == "auto" and delegate_name == "cpu":
+                print("  [INFO] MediaPipe GPU delegate unavailable; using CPU delegate")
+            break
+        except Exception as exc:
+            last_err = exc
+            _WORKER_LANDMARKER = None
+            continue
+
+    if _WORKER_LANDMARKER is None:
+        raise RuntimeError(f"Unable to initialize MediaPipe landmarker: {last_err}")
+
+    atexit.register(_close_worker_resources)
+
+def extract_video(video_paths, subject_id, label, video_file_key):
+    """Extract per-frame features from one (possibly multi-part) video.
+
+    video_paths: list of file-path strings (sorted by part number).
+    Returns a list of row-tuples matching COLUMNS.
+    """
+    global _WORKER_LANDMARKER
+    if _WORKER_LANDMARKER is None:
+        _init_worker()
+    landmarker = _WORKER_LANDMARKER
 
     features = []      # list of 10-element lists (or NaN list)
     n_detected = 0
@@ -224,7 +318,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
             print(f"  [ERROR] Cannot open part: {part_path}")
             continue
 
-        part_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        part_fps = _safe_part_fps(cap)
         frame_step_ms = 1000.0 / float(part_fps)
 
         while True:
@@ -232,6 +326,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
             if not ok:
                 break
 
+            h_cur, w_cur = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(mp_image, int(timestamp_ms))
@@ -239,7 +334,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
             if result.face_landmarks:
                 fl = result.face_landmarks[0]
                 lm = np.array(
-                    [(p.x * W, p.y * H) for p in fl],
+                    [(p.x * w_cur, p.y * h_cur) for p in fl],
                     dtype=np.float64,
                 )
 
@@ -251,7 +346,7 @@ def extract_video(video_paths, subject_id, label, video_file_key):
                                     RIGHT_EYE[0], RIGHT_EYE[3])
                 mar = compute_mar(lm)
                 muc = compute_muc(lm)
-                pitch, yaw, roll_val = compute_head_pose(lm, W, H)
+                pitch, yaw, roll_val = compute_head_pose(lm, w_cur, h_cur)
 
                 features.append([
                     ear_l, ear_r, (ear_l + ear_r) / 2.0,
@@ -267,16 +362,17 @@ def extract_video(video_paths, subject_id, label, video_file_key):
 
         cap.release()
 
-    landmarker.close()
-
     if fidx == 0:
         parts_str = ', '.join(video_paths)
         print(f"  [WARN] 0 frames read: {parts_str}")
         return []
 
-    # --- Fill missing detections: forward → backward → zero ---
-    df_feat = pd.DataFrame(features, columns=FEATURE_NAMES)
-    df_feat = df_feat.ffill().bfill().fillna(0.0)
+    if n_detected == 0:
+        print(f"  [WARN] No face landmarks detected for {video_file_key}; skipping video")
+        return []
+
+    # --- Fill short missing-detection gaps without hallucinating long spans ---
+    df_feat = _fill_feature_gaps(features)
 
     det_pct = n_detected / fidx * 100
     print(f"  Subject {subject_id:>2} | {video_file_key:>16s} | "
@@ -342,6 +438,7 @@ def discover_videos():
                       f"for label {label_str}: {names}")
             tasks.append((paths, subj_int, label, video_key))
 
+    tasks.sort(key=lambda t: (t[1], t[3]))
     return tasks
 
 
@@ -365,6 +462,8 @@ def _worker(args):
 def main():
     t_start = time.perf_counter()
 
+    if not DATASET_DIR.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {DATASET_DIR}")
     if not Path(MODEL_PATH).exists():
         raise FileNotFoundError(
             f"Missing MediaPipe model file: {MODEL_PATH}. "
@@ -372,19 +471,52 @@ def main():
         )
 
     tasks = discover_videos()
+    if not tasks:
+        print(f"ERROR: No videos found under {DATASET_DIR}")
+        return
+    worker_count = min(NUM_WORKERS, len(tasks))
+    chunk_size = max(1, len(tasks) // max(worker_count * EXTRACTOR_CHUNKS_PER_WORKER, 1))
+    if EXTRACTOR_MP_DELEGATE == "auto":
+        # Multi-process extraction scales better with CPU delegate; one-worker mode
+        # can opportunistically use GPU when available.
+        effective_delegate = "cpu" if worker_count > 1 else "auto"
+    else:
+        effective_delegate = EXTRACTOR_MP_DELEGATE
     n_subjects = len({t[1] for t in tasks})
     print(f"Found {len(tasks)} videos from {n_subjects} subjects "
           f"(labels: alert=0, drowsy=1, skipping low-drowsy=5)")
-    print(f"Using {NUM_WORKERS} worker processes (cpus={CPU_COUNT})\n")
+    print(
+        f"Using {worker_count} worker processes (cpus={CPU_COUNT}, "
+        f"opencv_threads/worker={EXTRACTOR_WORKER_THREADS}, omp_threads/worker={EXTRACTOR_OMP_THREADS}, "
+        f"delegate={effective_delegate}, chunksize={chunk_size})\n"
+    )
 
-    all_rows = []
+    tmp_csv = OUTPUT_CSV.with_suffix(OUTPUT_CSV.suffix + ".tmp")
+    total_frames = 0
+    n_alert = 0
+    n_drowsy = 0
+    written_videos = 0
+    written_subjects = set()
 
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as pool:
-        futures = {pool.submit(_worker, t): t for t in tasks}
+    with ProcessPoolExecutor(
+        max_workers=worker_count,
+        initializer=_init_worker,
+        initargs=(effective_delegate, EXTRACTOR_WORKER_THREADS, EXTRACTOR_OMP_THREADS),
+    ) as pool, tmp_csv.open('w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(COLUMNS)
         done_count = 0
-        for future in as_completed(futures):
-            rows = future.result()
-            all_rows.extend(rows)
+        for rows in pool.map(_worker, tasks, chunksize=chunk_size):
+            if rows:
+                writer.writerows(rows)
+                frame_count = len(rows)
+                total_frames += frame_count
+                written_videos += 1
+                written_subjects.add(rows[0][0])
+                if rows[0][3] == 0:
+                    n_alert += frame_count
+                else:
+                    n_drowsy += frame_count
             done_count += 1
             if done_count % 10 == 0 or done_count == len(tasks):
                 elapsed = time.perf_counter() - t_start
@@ -393,27 +525,20 @@ def main():
                 print(f"  Progress: {done_count}/{len(tasks)} videos | "
                       f"{elapsed:.0f}s elapsed | ~{eta:.0f}s remaining")
 
-    if not all_rows:
+    if total_frames == 0:
+        tmp_csv.unlink(missing_ok=True)
         print("ERROR: No features extracted. Check dataset path and video files.")
         return
 
-    # Build DataFrame, sort, and save
-    df = pd.DataFrame(all_rows, columns=COLUMNS)
-    df = df.sort_values(
-        ['Subject', 'Video_File', 'Frame']
-    ).reset_index(drop=True)
-
-    df.to_csv(str(OUTPUT_CSV), index=False)
+    tmp_csv.replace(OUTPUT_CSV)
 
     elapsed = time.perf_counter() - t_start
-    n_alert = (df['Label'] == 0).sum()
-    n_drowsy = (df['Label'] == 1).sum()
     print(f"\nDone in {elapsed:.1f}s")
-    print(f"  Total frames:  {len(df):,}")
+    print(f"  Total frames:  {total_frames:,}")
     print(f"  Alert (0):     {n_alert:,}")
     print(f"  Drowsy (1):    {n_drowsy:,}")
-    print(f"  Subjects:      {df['Subject'].nunique()}")
-    print(f"  Videos:        {df['Video_File'].nunique()}")
+    print(f"  Subjects:      {len(written_subjects)}")
+    print(f"  Videos:        {written_videos}")
     print(f"  Saved to:      {OUTPUT_CSV}")
 
 
