@@ -1039,7 +1039,8 @@ class HardBinaryAccuracy(keras.metrics.Metric):
         self._inner = keras.metrics.BinaryAccuracy(threshold=self.threshold)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_hard = tf.cast(y_true >= 0.5, y_pred.dtype)
+        y_true_f = tf.cast(y_true, tf.float32)
+        y_true_hard = tf.cast(y_true_f >= 0.5, y_pred.dtype)
         return self._inner.update_state(y_true_hard, y_pred, sample_weight=sample_weight)
 
     def result(self):
