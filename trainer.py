@@ -91,7 +91,7 @@ def _configure_tf_runtime() -> dict:
     elif mp_mode in {"on", "true", "1", "fp16", "mixed_float16"}:
         policy = "mixed_float16"
     else:  # auto
-        policy = "mixed_float16" if gpus else "float32"
+        policy = "mixed_bfloat16" if gpus else "float32"
     if not gpus and policy == "mixed_float16":
         print("WARNING: mixed_float16 requested without a GPU; falling back to float32")
         policy = "float32"
@@ -124,7 +124,7 @@ def _configure_tf_runtime() -> dict:
         "gpu_count": len(gpus),
     }
 
-from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
     average_precision_score,
@@ -151,8 +151,8 @@ NUM_FEATURES = NUM_RAW * 3 + 3      # 33  (raw + delta + ddelta + 3 temporal)
 ROLLING_WINDOW = 30                 # 1 s at 30 fps
 TEMPORAL_PAD   = ROLLING_WINDOW - 1 # 29 cold-start frames
 
-# PERCLOS proxy: EAR_Avg below this z-score → eye closed
-PERCLOS_EAR_Z_THRESHOLD = -0.25
+# PERCLOS proxy: EAR_Avg below this IQR-normalized threshold → eye closed
+PERCLOS_EAR_IQR_THRESHOLD = -0.25
 
 SAVGOL_WINDOW = 7
 SAVGOL_POLY   = 2
@@ -345,15 +345,24 @@ def _compute_feature_stats(df: pd.DataFrame) -> dict:
 def fit_subject_norm_params(
     df: pd.DataFrame,
     min_alert_frames: int = MIN_ALERT_FRAMES_FOR_ANCHOR,
+    use_alert_anchor: bool = True,
 ) -> tuple[dict, dict]:
-    """Fit train-only per-subject params plus a global fallback for unseen subjects."""
+    """Fit per-subject params plus a global fallback.
+
+    When use_alert_anchor=True (training), each subject is anchored on alert
+    frames if enough are available. When False (holdout/eval), all subject
+    frames are used to avoid label-informed anchoring.
+    """
     if df.empty:
         raise ValueError("Cannot fit normalisation params on an empty dataframe.")
 
     subject_params: dict = {}
     for subj, grp in df.groupby("Subject", sort=False):
-        alert = grp[grp["Label"] == 0]
-        anchor = alert if len(alert) >= min_alert_frames else grp
+        if use_alert_anchor:
+            alert = grp[grp["Label"] == 0]
+            anchor = alert if len(alert) >= min_alert_frames else grp
+        else:
+            anchor = grp
         subject_params[str(subj)] = _compute_feature_stats(anchor)
 
     global_params = {
@@ -465,7 +474,7 @@ def apply_enhanced_features(X_raw: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
     # PERCLOS proxy: rolling fraction of frames with EAR below closure threshold
-    closed = (ear < PERCLOS_EAR_Z_THRESHOLD).astype(np.float32)
+    closed = (ear < PERCLOS_EAR_IQR_THRESHOLD).astype(np.float32)
     closed_pad = np.pad(closed, ((0, 0), (ROLLING_WINDOW - 1, 0)), mode="edge")
     perclos = np.mean(
         sliding_window_view(closed_pad, ROLLING_WINDOW, axis=1), axis=2
@@ -630,6 +639,7 @@ def _apply_mixup_with_global_partners(
     X_raw_pool: np.ndarray,
     y_pool: np.ndarray,
     rng: np.random.Generator,
+    target_mask: np.ndarray | None = None,
     temporal_pad: int = 0,
     alpha: float = MIXUP_ALPHA,
     fraction: float = MIXUP_FRACTION,
@@ -640,8 +650,19 @@ def _apply_mixup_with_global_partners(
     if n < 1 or pool_n < 1 or fraction <= 0.0:
         return X, y
 
-    k = max(1, int(n * fraction))
-    tgt = rng.choice(n, size=k, replace=False)
+    if target_mask is None:
+        candidate_idx = np.arange(n)
+    else:
+        target_mask = np.asarray(target_mask, dtype=bool)
+        if target_mask.shape[0] != n:
+            raise ValueError(f"target_mask length ({target_mask.shape[0]}) != batch length ({n})")
+        candidate_idx = np.flatnonzero(target_mask)
+    if len(candidate_idx) == 0:
+        return X, y
+
+    k = max(1, int(len(candidate_idx) * fraction))
+    k = min(k, len(candidate_idx))
+    tgt = rng.choice(candidate_idx, size=k, replace=False)
     partner_idx = rng.integers(0, pool_n, size=k)
 
     X_partner = apply_enhanced_features(X_raw_pool[partner_idx])
@@ -654,49 +675,6 @@ def _apply_mixup_with_global_partners(
     X[tgt] = lam * X[tgt] + (1.0 - lam) * X_partner
     y[tgt] = lam.reshape(-1) * y[tgt] + (1.0 - lam.reshape(-1)) * y_partner
     return X, y
-
-
-def build_augmented_dataset(
-    X_raw: np.ndarray,
-    y: np.ndarray,
-    rng: np.random.Generator,
-    n_rounds: int = AUGMENT_ROUNDS,
-    temporal_pad: int = 0,
-) -> tuple:
-    """Augment raw seqs → compute enhanced features per copy → mixup.
-
-    Each augmented copy is feature-engineered and released independently
-    to avoid holding n_rounds+1 raw copies in memory simultaneously.
-    Augmentation happens on raw sequences before feature engineering so that
-    PERCLOS (a rolling threshold-derived feature) is recomputed from the
-    augmented EAR values rather than being linearly blended directly.
-    """
-    X_base_enh = apply_enhanced_features(X_raw)
-    if temporal_pad > 0:
-        X_base_enh = X_base_enh[:, temporal_pad:, :]
-
-    parts_X = [X_base_enh]
-    parts_y = [y.astype(np.float32)]
-
-    for _ in range(n_rounds):
-        Xa, ya = _augment_batch(X_raw, y, rng)
-        Xa_enh = apply_enhanced_features(Xa)
-        if temporal_pad > 0:
-            Xa_enh = Xa_enh[:, temporal_pad:, :]
-        parts_X.append(Xa_enh)
-        parts_y.append(ya.astype(np.float32))
-        del Xa, Xa_enh
-
-    X_all = np.concatenate(parts_X, axis=0)
-    y_all = np.concatenate(parts_y, axis=0)
-    del parts_X, parts_y
-
-    perm       = rng.permutation(len(X_all))
-    X_all, y_all = X_all[perm], y_all[perm]
-
-    X_all, y_all = _apply_inplace_mixup(X_all, y_all, rng)
-
-    return X_all, y_all
 
 
 class AugmentedSequence(keras.utils.Sequence):
@@ -771,6 +749,7 @@ class AugmentedSequence(keras.utils.Sequence):
             self.X_raw,
             self.y,
             rng,
+            target_mask=aug_mask,
             temporal_pad=self.temporal_pad,
         )
         return X_feat, y_batch
@@ -1031,27 +1010,67 @@ def cosine_lr_schedule(epoch: int, _lr: float = None) -> float:
 
 
 class HardBinaryAccuracy(keras.metrics.Metric):
-    """BinaryAccuracy with hard-thresholded labels for MixUp-style soft targets."""
+    """Hard-label accuracy for MixUp targets, excluding ambiguous soft labels."""
 
-    def __init__(self, name: str = "hard_accuracy", threshold: float = 0.5, **kwargs):
+    def __init__(
+        self,
+        name: str = "hard_accuracy",
+        threshold: float = 0.5,
+        ambiguous_low: float = 0.25,
+        ambiguous_high: float = 0.75,
+        **kwargs,
+    ):
         super().__init__(name=name, **kwargs)
         self.threshold = float(threshold)
-        self._inner = keras.metrics.BinaryAccuracy(threshold=self.threshold)
+        self.ambiguous_low = float(ambiguous_low)
+        self.ambiguous_high = float(ambiguous_high)
+        if not (0.0 <= self.ambiguous_low < self.ambiguous_high <= 1.0):
+            raise ValueError(
+                "Expected 0 <= ambiguous_low < ambiguous_high <= 1, got "
+                f"{self.ambiguous_low}, {self.ambiguous_high}"
+            )
+        self.correct = self.add_weight(name="correct", initializer="zeros")
+        self.count = self.add_weight(name="count", initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_f = tf.cast(y_true, tf.float32)
-        y_true_hard = tf.cast(y_true_f >= 0.5, y_pred.dtype)
-        return self._inner.update_state(y_true_hard, y_pred, sample_weight=sample_weight)
+        y_true_f = tf.reshape(tf.cast(y_true, tf.float32), [-1])
+        y_pred_f = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
+        y_true_hard = tf.cast(y_true_f >= self.threshold, tf.float32)
+        y_pred_hard = tf.cast(y_pred_f >= self.threshold, tf.float32)
+
+        eligible = tf.logical_or(
+            y_true_f <= self.ambiguous_low,
+            y_true_f >= self.ambiguous_high,
+        )
+        weights = tf.cast(eligible, tf.float32)
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            if sw.shape.rank == 0:
+                sw = tf.fill(tf.shape(weights), sw)
+            else:
+                sw = tf.reshape(sw, [-1])
+            weights = weights * sw
+
+        matches = tf.cast(tf.equal(y_true_hard, y_pred_hard), tf.float32)
+        self.correct.assign_add(tf.reduce_sum(matches * weights))
+        self.count.assign_add(tf.reduce_sum(weights))
 
     def result(self):
-        return self._inner.result()
+        return tf.math.divide_no_nan(self.correct, self.count)
 
     def reset_state(self):
-        self._inner.reset_state()
+        self.correct.assign(0.0)
+        self.count.assign(0.0)
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update({"threshold": self.threshold})
+        cfg.update(
+            {
+                "threshold": self.threshold,
+                "ambiguous_low": self.ambiguous_low,
+                "ambiguous_high": self.ambiguous_high,
+            }
+        )
         return cfg
 
 
@@ -1184,11 +1203,23 @@ def run_cross_validation(df: pd.DataFrame) -> list:
         df_tr = prepare_split_features(
             df_tr, norm_params, global_norm, True, "train", apply_savgol_filter=SAVGOL_ON_TRAIN
         )
+        if df_va.empty:
+            va_norm_params, va_global_norm = {}, global_norm
+        else:
+            va_norm_params, va_global_norm = fit_subject_norm_params(
+                df_va, use_alert_anchor=True
+            )
         df_va = prepare_split_features(
-            df_va, norm_params, global_norm, False, "val", apply_savgol_filter=SAVGOL_ON_EVAL
+            df_va, va_norm_params, va_global_norm, True, "val", apply_savgol_filter=SAVGOL_ON_EVAL
         )
+        if df_te.empty:
+            te_norm_params, te_global_norm = {}, global_norm
+        else:
+            te_norm_params, te_global_norm = fit_subject_norm_params(
+                df_te, use_alert_anchor=True
+            )
         df_te = prepare_split_features(
-            df_te, norm_params, global_norm, False, "test", apply_savgol_filter=SAVGOL_ON_EVAL
+            df_te, te_norm_params, te_global_norm, True, "test", apply_savgol_filter=SAVGOL_ON_EVAL
         )
 
         X_raw, y_tr  = _create_raw_sequences(df_tr, SEQ_LEN, TRAIN_STEP, TEMPORAL_PAD)
@@ -1345,14 +1376,33 @@ def train_final_model(df: pd.DataFrame) -> None:
     df_tr = prepare_split_features(
         df_tr, norm_params, global_norm, True, "train", apply_savgol_filter=SAVGOL_ON_TRAIN
     )
+    if df_va.empty:
+        va_norm_params, va_global_norm = {}, global_norm
+    else:
+        va_norm_params, va_global_norm = fit_subject_norm_params(
+            df_va, use_alert_anchor=True
+        )
+    if df_thr.empty:
+        thr_norm_params, thr_global_norm = {}, global_norm
+    else:
+        thr_norm_params, thr_global_norm = fit_subject_norm_params(
+            df_thr, use_alert_anchor=True
+        )
+    if df_rep.empty:
+        rep_norm_params, rep_global_norm = {}, global_norm
+    else:
+        rep_norm_params, rep_global_norm = fit_subject_norm_params(
+            df_rep, use_alert_anchor=True
+        )
+
     df_va = prepare_split_features(
-        df_va, norm_params, global_norm, False, "val", apply_savgol_filter=SAVGOL_ON_EVAL
+        df_va, va_norm_params, va_global_norm, True, "val", apply_savgol_filter=SAVGOL_ON_EVAL
     )
     df_thr = prepare_split_features(
-        df_thr, norm_params, global_norm, False, "thr", apply_savgol_filter=SAVGOL_ON_EVAL
+        df_thr, thr_norm_params, thr_global_norm, True, "thr", apply_savgol_filter=SAVGOL_ON_EVAL
     )
     df_rep = prepare_split_features(
-        df_rep, norm_params, global_norm, False, "report", apply_savgol_filter=SAVGOL_ON_EVAL
+        df_rep, rep_norm_params, rep_global_norm, True, "report", apply_savgol_filter=SAVGOL_ON_EVAL
     )
 
     X_raw, y_tr  = _create_raw_sequences(df_tr, SEQ_LEN, TRAIN_STEP, TEMPORAL_PAD)
@@ -1466,7 +1516,7 @@ def train_final_model(df: pd.DataFrame) -> None:
         "num_features":            NUM_FEATURES,
         "feature_names":           FEATURES,
         "rolling_window":          ROLLING_WINDOW,
-        "perclos_ear_z_threshold": PERCLOS_EAR_Z_THRESHOLD,
+        "perclos_ear_iqr_threshold": PERCLOS_EAR_IQR_THRESHOLD,
     }
     cfg_path = os.path.join(BASE_DIR, "deploy_config.json")
     with open(cfg_path, "w") as fh:
