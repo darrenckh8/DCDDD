@@ -1,0 +1,33 @@
+{
+  "threshold": 0.18,
+  "smooth_k": 2,
+  "deploy_use_tta": false,
+  "fixed_threshold": null,
+  "int8_full_io": false,
+  "runtime_batch_size": 256,
+  "runtime_strategy": "OneDeviceStrategy(CPU)",
+  "runtime_replicas": 1,
+  "runtime_xla_enabled": true,
+  "runtime_mp_policy": "float32",
+  "focal_alpha_used": 0.49063694849342954,
+  "normalization_mode": "train_subject_anchor_with_global_fallback_for_unseen_subjects",
+  "savgol_on_train": false,
+  "savgol_on_eval": false,
+  "sequence_length": 150,
+  "num_raw_features": 10,
+  "num_features": 33,
+  "feature_names": [
+    "EAR_Left",
+    "EAR_Right",
+    "EAR_Avg",
+    "MAR",
+    "PUC_Left",
+    "PUC_Right",
+    "MUC",
+    "Pitch",
+    "Yaw",
+    "Roll"
+  ],
+  "rolling_window": 30,
+  "perclos_ear_iqr_threshold": -0.25
+}

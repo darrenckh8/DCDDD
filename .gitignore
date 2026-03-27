@@ -1,7 +1,4 @@
 /dataset
 /.venv
 uta_rldd_features.csv
-*.tflite
-*.json
-*.keras
 .DS_Store
