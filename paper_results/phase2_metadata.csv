@@ -1,0 +1,7 @@
+key,value
+deployment_threshold,0.18
+report_subjects,6
+thr_tune_subjects,6
+threshold_holdout_sequences,11225
+train_subjects,42
+val_subjects,6

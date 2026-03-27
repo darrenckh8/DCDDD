@@ -1,0 +1,5 @@
+category,name,path_or_variant,size_kb,avg_ms,p50_ms,p95_ms
+artifact_size,Float16 TFLite,C:\Users\Darre\Documents\DCDDD\drowsiness_mv3_lstm_f16.tflite,756.6,,,
+artifact_size,INT8 TFLite (hybrid-f32-io),C:\Users\Darre\Documents\DCDDD\drowsiness_mv3_lstm_int8.tflite,757.0,,,
+latency,Float16,,,0.33,0.27,0.64
+latency,INT8-hybrid,,,0.43,0.42,0.46

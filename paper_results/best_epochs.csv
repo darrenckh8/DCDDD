@@ -1,0 +1,5 @@
+phase,fold,best_epoch_by_val_auc,best_val_auc,best_val_accuracy,best_val_loss,last_epoch,last_val_auc,last_val_accuracy,epochs_ran
+phase1_cv,1,37,0.9927,0.9628,0.0151,62,0.9899,0.9525,62
+phase1_cv,2,4,0.9766,0.9053,0.0334,29,0.9406,0.8463,29
+phase1_cv,3,68,0.955,0.859,0.0505,93,0.9294,0.8292,93
+phase2_final,,14,0.9091,0.8295,0.1246,39,0.8773,0.785,39

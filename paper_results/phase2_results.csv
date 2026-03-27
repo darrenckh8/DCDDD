@@ -1,0 +1,4 @@
+split,label,threshold,auc,prauc,accuracy,accuracy_05,f1,f1_05,precision,recall,recall_05,cm_tn,cm_fp,cm_fn,cm_tp,support
+report_honest,Held-out report set (HONEST - unseen during all training),0.18,0.9214,0.9121,0.8427,0.8027,0.8341,0.7371,0.8079,0.862,0.6029,5190,1090,734,4585,11599
+validation_tainted,Validation set (tainted: checkpoint was selected on val_auc),0.18,0.9092,0.9278,0.8487,0.817,0.8399,0.7777,0.8776,0.8052,0.6496,6411,785,1362,5630,14188
+threshold_holdout_tainted,Threshold holdout (tainted: threshold was tuned on this set),0.18,0.8831,0.8384,0.8429,0.698,0.8397,0.614,0.8944,0.7912,0.4621,4846,545,1218,4616,11225

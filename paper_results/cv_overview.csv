@@ -1,0 +1,10 @@
+key,value
+aggregate_cm_fn,11862
+aggregate_cm_fp,6337
+aggregate_cm_tn,62651
+aggregate_cm_tp,58324
+best_fold,2
+best_fold_auc,0.9474
+best_fold_model_path,C:\Users\Darre\Documents\DCDDD\best_fold_model.keras
+mean_threshold,0.325
+thresholds,"0.370,0.380,0.225"
