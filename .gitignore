@@ -1,6 +1,6 @@
 /dataset
 /.venv
-*.csv
+uta_rldd_features.csv
 *.tflite
 *.json
 *.keras
