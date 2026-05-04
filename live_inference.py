@@ -34,11 +34,11 @@ import os
 import sys
 import time
 
-import numpy as np
 from pathlib import Path
-from numpy.lib.stride_tricks import sliding_window_view
 
 try:
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
     import cv2
     import mediapipe as mp
 except ModuleNotFoundError as exc:
@@ -54,6 +54,19 @@ DEFAULT_MODEL   = BASE_DIR / "drowsiness_mv3_lstm.keras"
 DEPLOY_CFG_PATH = BASE_DIR / "deploy_config.json"
 GLOBAL_NORM_PATH = BASE_DIR / "norm_global_params.json"
 MP_MODEL_PATH   = str(BASE_DIR / "face_landmarker.task")
+
+FEATURE_NAMES = [
+    "EAR_Left", "EAR_Right", "EAR_Avg", "MAR",
+    "PUC_Left", "PUC_Right", "MUC", "Pitch", "Yaw", "Roll",
+]
+NUM_RAW_FEATURES = len(FEATURE_NAMES)
+
+# Matches extractor.py's default MAX_GAP_FILL. Real-time inference cannot use
+# future frames for interpolation, so this is a causal forward-fill equivalent.
+DEFAULT_MAX_GAP_FILL = 15
+
+# trainer.py evaluates/tunes thresholds on windows spaced by EVAL_STEP.
+DEFAULT_PREDICT_STRIDE = 15
 
 # ─────────────────────────── MediaPipe landmarks ─────────────────────────────
 
@@ -138,6 +151,47 @@ def extract_features(fl, W, H):
                      mar, puc_l, puc_r, muc,
                      pitch, yaw, roll], dtype=np.float32)
 
+
+class LiveFeatureState:
+    """Causal live equivalent of extractor gap handling and angle unwrapping."""
+
+    def __init__(self, max_gap_fill=DEFAULT_MAX_GAP_FILL):
+        self.max_gap_fill = max(0, int(max_gap_fill))
+        self.last_raw = None
+        self.prev_angles = None
+        self.gap_count = 0
+
+    def _unwrap_angles(self, angles):
+        angles = angles.astype(np.float32, copy=True)
+        if self.prev_angles is None:
+            unwrapped = angles
+        else:
+            unwrapped = angles + 360.0 * np.round((self.prev_angles - angles) / 360.0)
+        self.prev_angles = unwrapped.astype(np.float32)
+        return self.prev_angles
+
+    def update(self, detected_raw):
+        """Return a raw 10-feature frame, or None until the first face appears."""
+        if detected_raw is not None:
+            raw = detected_raw.astype(np.float32, copy=True)
+            raw[7:10] = self._unwrap_angles(raw[7:10])
+            self.last_raw = raw
+            self.gap_count = 0
+            return raw
+
+        if self.last_raw is None:
+            return None
+
+        self.gap_count += 1
+        if self.gap_count <= self.max_gap_fill:
+            return self.last_raw.copy()
+
+        # extractor.py leaves long gaps as zeros after limited filling. Reset
+        # angle continuity so a new face after a long gap starts a fresh track.
+        self.last_raw = np.zeros(NUM_RAW_FEATURES, dtype=np.float32)
+        self.prev_angles = np.zeros(3, dtype=np.float32)
+        return self.last_raw.copy()
+
 # ─────────────────────────── Enhanced features (mirrors trainer.py) ──────────
 
 def apply_enhanced_features(X_raw, rolling_window, perclos_threshold):
@@ -191,17 +245,17 @@ def smooth_predict(probs, threshold, K):
 def normalise_window(raw_window, norm_params):
     """Apply per-feature median/IQR normalisation to a (T, 10) array."""
     out = raw_window.copy()
-    feature_names = [
-        "EAR_Left", "EAR_Right", "EAR_Avg", "MAR",
-        "PUC_Left", "PUC_Right", "MUC", "Pitch", "Yaw", "Roll",
-    ]
-    for i, feat in enumerate(feature_names):
+    for i, feat in enumerate(FEATURE_NAMES):
         med = norm_params[feat]["median"]
         iqr = norm_params[feat]["iqr"]
         if abs(iqr) < 1e-6:
             iqr = 1.0
         out[:, i] = (out[:, i] - med) / iqr
     return out
+
+def normalise_frame(raw_frame, norm_params):
+    """Apply per-feature median/IQR normalisation to a single 10-feature frame."""
+    return normalise_window(raw_frame[np.newaxis, :], norm_params)[0]
 
 def compute_norm_params_from_clip(clip_path, landmarker):
     """Compute per-subject norm params from a short alert clip."""
@@ -211,6 +265,7 @@ def compute_norm_params_from_clip(clip_path, landmarker):
         raise FileNotFoundError(f"Cannot open alert clip: {clip_path}")
 
     raw_features = []
+    feature_state = LiveFeatureState()
     ts_ms = 0.0
     fps   = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
 
@@ -222,8 +277,10 @@ def compute_norm_params_from_clip(clip_path, landmarker):
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img    = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = landmarker.detect_for_video(img, int(ts_ms))
-        if result.face_landmarks:
-            raw_features.append(extract_features(result.face_landmarks[0], W, H))
+        detected = extract_features(result.face_landmarks[0], W, H) if result.face_landmarks else None
+        raw = feature_state.update(detected)
+        if raw is not None:
+            raw_features.append(raw)
         ts_ms += 1000.0 / fps
 
     cap.release()
@@ -231,12 +288,8 @@ def compute_norm_params_from_clip(clip_path, landmarker):
         raise ValueError(f"Alert clip too short: only {len(raw_features)} frames detected")
 
     arr = np.array(raw_features)
-    feature_names = [
-        "EAR_Left", "EAR_Right", "EAR_Avg", "MAR",
-        "PUC_Left", "PUC_Right", "MUC", "Pitch", "Yaw", "Roll",
-    ]
     params = {}
-    for i, feat in enumerate(feature_names):
+    for i, feat in enumerate(FEATURE_NAMES):
         col = arr[:, i]
         med = float(np.median(col))
         iqr = float(np.percentile(col, 75) - np.percentile(col, 25))
@@ -260,7 +313,7 @@ def load_model(model_path):
         return ("tflite", interp, inp_det, out_det)
     else:
         import tensorflow as tf
-        model = tf.keras.models.load_model(path)
+        model = tf.keras.models.load_model(path, compile=False)
         print(f"Loaded Keras model: {path}")
         return ("keras", model)
 
@@ -275,6 +328,8 @@ def run_model(model_bundle, X):
         inp_dtype = inp_det[0]["dtype"]
         if inp_dtype == np.int8:
             scale, zero = inp_det[0]["quantization"]
+            if scale <= 0:
+                raise ValueError("Invalid int8 quantization scale for TFLite input.")
             X_in = np.clip(np.round(X / scale + zero), -128, 127).astype(np.int8)
         else:
             X_in = X.astype(inp_dtype)
@@ -331,11 +386,23 @@ def run_inference(args):
     with open(DEPLOY_CFG_PATH) as f:
         cfg = json.load(f)
 
-    threshold   = cfg["threshold"]
-    smooth_k    = cfg["smooth_k"]
-    seq_len     = cfg["sequence_length"]
-    rolling_win = cfg["rolling_window"]
-    perclos_thr = cfg["perclos_ear_iqr_threshold"]
+    cfg_features = cfg.get("feature_names")
+    if cfg_features is not None and cfg_features != FEATURE_NAMES:
+        sys.exit(
+            "deploy_config.json feature_names do not match live_inference.py: "
+            f"{cfg_features} != {FEATURE_NAMES}"
+        )
+
+    threshold   = float(cfg["threshold"])
+    smooth_k    = max(1, int(cfg["smooth_k"]))
+    seq_len     = int(cfg["sequence_length"])
+    rolling_win = int(cfg["rolling_window"])
+    perclos_thr = float(cfg["perclos_ear_iqr_threshold"])
+    predict_stride = args.predict_stride
+    if predict_stride is None:
+        predict_stride = int(cfg.get("eval_step", DEFAULT_PREDICT_STRIDE))
+    predict_stride = max(1, int(predict_stride))
+    max_gap_fill = int(cfg.get("max_gap_fill", DEFAULT_MAX_GAP_FILL))
     temporal_pad = rolling_win - 1
     padded_len   = seq_len + temporal_pad
 
@@ -380,18 +447,20 @@ def run_inference(args):
 
     cam_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
     print(f"\nRunning at ~{cam_fps:.0f} fps  |  "
-          f"seq_len={seq_len}  |  threshold={threshold:.3f}  |  K={smooth_k}")
+          f"seq_len={seq_len}  |  stride={predict_stride}  |  "
+          f"threshold={threshold:.3f}  |  K={smooth_k}")
     print("Press Q to quit.\n")
 
     # ── Buffers ───────────────────────────────────────────────────────────────
-    # ring_buf: stores the last padded_len raw normalised frames
+    # ring_buf: stores the last padded_len normalised frames
     ring_buf    = collections.deque(maxlen=padded_len)
     # prob_buf: stores the last smooth_k predictions for smoothing
     prob_buf    = collections.deque(maxlen=smooth_k)
-    # last known raw features (used to fill gaps when face not detected)
-    last_raw    = np.zeros(10, dtype=np.float32)
+    # state used to fill short gaps and unwrap head-pose angles
+    feature_state = LiveFeatureState(max_gap_fill=max_gap_fill)
 
     frame_count = 0
+    feature_count = 0
     ts_ms       = 0.0
     label       = None
     prob        = None
@@ -417,30 +486,24 @@ def run_inference(args):
         result = landmarker.detect_for_video(img, int(ts_ms))
         ts_ms += 1000.0 / cam_fps
 
-        if result.face_landmarks:
-            raw = extract_features(result.face_landmarks[0], W, H)
-            last_raw = raw
-        else:
-            raw = last_raw.copy()   # hold last known
+        detected = extract_features(result.face_landmarks[0], W, H) if result.face_landmarks else None
+        raw = feature_state.update(detected)
 
         # ── Normalise and buffer ──────────────────────────────────────────────
-        normed    = raw.copy()
-        feat_names = [
-            "EAR_Left", "EAR_Right", "EAR_Avg", "MAR",
-            "PUC_Left", "PUC_Right", "MUC", "Pitch", "Yaw", "Roll",
-        ]
-        for i, feat in enumerate(feat_names):
-            med = norm_params[feat]["median"]
-            iqr = norm_params[feat]["iqr"]
-            if abs(iqr) < 1e-6:
-                iqr = 1.0
-            normed[i] = (raw[i] - med) / iqr
-
-        ring_buf.append(normed)
+        if raw is not None:
+            ring_buf.append(normalise_frame(raw, norm_params))
+            feature_count += 1
 
         # ── Run model once we have enough frames ──────────────────────────────
-        if len(ring_buf) >= padded_len:
-            window = np.array(ring_buf, dtype=np.float32)   # (padded_len, 10)
+        should_predict = (
+            len(ring_buf) >= seq_len and
+            (feature_count - seq_len) % predict_stride == 0
+        )
+        if should_predict:
+            window = np.array(ring_buf, dtype=np.float32)   # (<= padded_len, 10)
+            if len(window) < padded_len:
+                pad_n = padded_len - len(window)
+                window = np.pad(window, ((pad_n, 0), (0, 0)), mode="edge")
 
             # Enhanced features and trim temporal pad
             X_enh = apply_enhanced_features(
@@ -454,14 +517,8 @@ def run_inference(args):
             prob_buf.append(prob)
 
             # Temporal smoothing: need K consecutive windows
-            if len(prob_buf) == smooth_k:
-                preds = smooth_predict(
-                    np.array(list(prob_buf)), threshold, smooth_k
-                )
-                label = int(preds[-1])
-            elif len(prob_buf) > 0:
-                # Not enough history yet — use single-window decision
-                label = int(prob >= threshold)
+            preds = smooth_predict(np.array(list(prob_buf)), threshold, smooth_k)
+            label = int(preds[-1])
 
         # ── Draw and show ─────────────────────────────────────────────────────
         frame = draw_overlay(frame, prob, label, threshold, frame_count, fps_display)
@@ -485,6 +542,9 @@ def parse_args():
                    help="Path to .keras or .tflite model")
     p.add_argument("--alert-clip",  default=None,
                    help="Path to a short alert video for per-subject calibration")
+    p.add_argument("--predict-stride", type=int, default=None,
+                   help=("Run the model every N accepted frames. Defaults to "
+                         "deploy_config eval_step, or 15 to match trainer.py."))
     return p.parse_args()
 
 
