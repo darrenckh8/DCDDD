@@ -14,6 +14,7 @@
   "savgol_on_train": false,
   "savgol_on_eval": false,
   "sequence_length": 150,
+  "eval_step": 15,
   "num_raw_features": 10,
   "num_features": 33,
   "feature_names": [
