@@ -1512,6 +1512,7 @@ def train_final_model(df: pd.DataFrame) -> None:
         "savgol_on_train":         SAVGOL_ON_TRAIN,
         "savgol_on_eval":          SAVGOL_ON_EVAL,
         "sequence_length":         SEQ_LEN,
+        "eval_step":               EVAL_STEP,
         "num_raw_features":        NUM_RAW,
         "num_features":            NUM_FEATURES,
         "feature_names":           FEATURES,
