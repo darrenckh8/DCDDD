@@ -1296,7 +1296,8 @@ class MainWindow(QMainWindow):
 def parse_args():
     ap = argparse.ArgumentParser(description="DrowsGuard Dashcam UI")
     ap.add_argument("--source",        default="0",
-                    help="Camera index or video file path")
+                    help=("Picamera2 camera index, e.g. 0, or a video file path "
+                          "for OpenCV playback"))
     ap.add_argument("--model",         default=str(DEFAULT_MODEL),
                     help="Path to .keras or .tflite model")
     ap.add_argument("--alert-clip",    default=None, dest="alert_clip",
@@ -1304,6 +1305,12 @@ def parse_args():
     ap.add_argument("--predict-stride", type=int, default=None,
                     help=("Run the model every N accepted frames. Defaults to "
                           "deploy_config eval_step, or 15 to match trainer.py."))
+    ap.add_argument("--camera-width", type=int, default=640,
+                    help="Picamera2 capture width for numeric camera sources")
+    ap.add_argument("--camera-height", type=int, default=480,
+                    help="Picamera2 capture height for numeric camera sources")
+    ap.add_argument("--camera-fps", type=int, default=30,
+                    help="Requested Picamera2 frame rate for numeric camera sources")
     ap.add_argument("--no-fullscreen", action="store_true",
                     help="Run in a window instead of full screen")
     return ap.parse_args()
