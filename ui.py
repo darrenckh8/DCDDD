@@ -224,7 +224,22 @@ def open_frame_source(source, camera_width=640, camera_height=480, camera_fps=30
     return OpenCVVideoCapture(str(source))
 
 
-def compute_norm_params_from_frames(raw_features):
+def stabilise_norm_params(params, fallback_params):
+    stable = {}
+    for feat in FEATURE_NAMES:
+        fallback = fallback_params.get(feat, {"median": 0.0, "iqr": 1.0})
+        med = float(params.get(feat, {}).get("median", fallback["median"]))
+        iqr = float(params.get(feat, {}).get("iqr", fallback["iqr"]))
+        fallback_iqr = abs(float(fallback.get("iqr", 1.0))) or 1.0
+        if not np.isfinite(med):
+            med = float(fallback.get("median", 0.0))
+        if not np.isfinite(iqr) or iqr < fallback_iqr:
+            iqr = fallback_iqr
+        stable[feat] = {"median": med, "iqr": iqr}
+    return stable
+
+
+def compute_norm_params_from_frames(raw_features, fallback_params):
     arr = np.asarray(raw_features, dtype=np.float32)
     params = {}
     for i, feat in enumerate(FEATURE_NAMES):
@@ -234,7 +249,7 @@ def compute_norm_params_from_frames(raw_features):
         if iqr < 1e-6:
             iqr = 1.0
         params[feat] = {"median": med, "iqr": iqr}
-    return params
+    return stabilise_norm_params(params, fallback_params)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -409,7 +424,8 @@ class InferenceWorker(QThread):
 
         try:
             with open(GLOBAL_NORM_PATH) as f:
-                norm_params = json.load(f)
+                global_norm = json.load(f)
+                norm_params = global_norm
         except Exception as e:
             self.signals.error.emit(f"Norm params: {e}"); return
 
@@ -428,7 +444,10 @@ class InferenceWorker(QThread):
 
         if self.alert_clip:
             try:
-                norm_params = compute_norm_params_from_clip(self.alert_clip, landmarker)
+                norm_params = stabilise_norm_params(
+                    compute_norm_params_from_clip(self.alert_clip, landmarker),
+                    global_norm,
+                )
                 landmarker.close()
                 landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(opts)
             except Exception as e:
@@ -514,7 +533,7 @@ class InferenceWorker(QThread):
                             display_raw = raw
                         calibration_state = "calibrating"
                         if len(calibration_raw) >= self.calibration_frames:
-                            norm_params = compute_norm_params_from_frames(calibration_raw)
+                            norm_params = compute_norm_params_from_frames(calibration_raw, global_norm)
                             self._calibrated = True
                             calibration_state = "ready"
                             ring_buf.clear()
