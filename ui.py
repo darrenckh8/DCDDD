@@ -782,14 +782,6 @@ class CameraWidget(QWidget):
                 calibration_state, calibration_progress,
             )
 
-        alert_text = "ALERT" if compact else "DROWSINESS ALERT"
-        if label == 1 and calibrated and face_ok and not warmup and not paused:
-            alert_h = 44 if compact else 64
-            alert_y = max(top_h + 6, h // 2 - alert_h // 2)
-            p.fillRect(0, alert_y, w, alert_h, QColor(P["red"]))
-            p.setFont(QFont("DejaVu Sans", 16 if compact else 23, QFont.Bold))
-            p.setPen(QColor("#ffffff"))
-            p.drawText(QRect(0, alert_y, w, alert_h), Qt.AlignCenter, alert_text)
         p.end()
 
     def _draw_calibration_overlay(self, p, w, h, compact, tiny, face_ok, state, progress):
