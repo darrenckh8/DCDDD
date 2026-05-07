@@ -117,6 +117,8 @@ P = {
     "scanline":   "#17191c",
 }
 
+DEFAULT_CALIBRATION_FRAMES = 90
+
 def configure_qt_environment(qt_platform=None):
     """Keep OpenCV's bundled Qt plugins from hijacking PyQt startup."""
     for name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
@@ -222,6 +224,19 @@ def open_frame_source(source, camera_width=640, camera_height=480, camera_fps=30
     return OpenCVVideoCapture(str(source))
 
 
+def compute_norm_params_from_frames(raw_features):
+    arr = np.asarray(raw_features, dtype=np.float32)
+    params = {}
+    for i, feat in enumerate(FEATURE_NAMES):
+        col = arr[:, i]
+        med = float(np.median(col))
+        iqr = float(np.percentile(col, 75) - np.percentile(col, 25))
+        if iqr < 1e-6:
+            iqr = 1.0
+        params[feat] = {"median": med, "iqr": iqr}
+    return params
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INFERENCE WORKER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,10 +258,14 @@ class DemoWorker(QThread):
         self._running = True
         self._paused  = False
         self.threshold = 0.5
+        self._calibrated = False
+        self._calibration_requested = False
 
     def pause(self):  self._paused = True
     def resume(self): self._paused = False
     def stop(self):   self._running = False; self.wait(2000)
+    def start_calibration(self):
+        self._calibration_requested = True
 
     def run(self):
         t = 0.0
@@ -271,6 +290,29 @@ class DemoWorker(QThread):
                             (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                             (0, 200, 100), 2)
 
+            if not self._calibrated:
+                if self._calibration_requested:
+                    self._calibrated = True
+                    state = "ready"
+                    progress = 1.0
+                else:
+                    state = "waiting"
+                    progress = 0.0
+                self.signals.frame_ready.emit(frame, {
+                    "prob": None,
+                    "label": None,
+                    "fps": 28.5,
+                    "frame_count": fc,
+                    "face_detected": True,
+                    "threshold": self.threshold,
+                    "warmup": True,
+                    "calibrated": self._calibrated,
+                    "calibration_state": state,
+                    "calibration_progress": progress,
+                })
+                time.sleep(0.033)
+                continue
+
             prob = 0.5 + 0.45 * math.sin(t * 0.18)
             metrics = {
                 "prob":         prob,
@@ -291,6 +333,9 @@ class DemoWorker(QThread):
                 "face_detected": True,
                 "threshold":    self.threshold,
                 "warmup":       fc < 30,
+                "calibrated":   True,
+                "calibration_state": "ready",
+                "calibration_progress": 1.0,
             }
             self.signals.frame_ready.emit(frame, metrics)
             time.sleep(0.033)
@@ -308,6 +353,7 @@ class InferenceWorker(QThread):
         camera_width=640,
         camera_height=480,
         camera_fps=30,
+        calibration_frames=DEFAULT_CALIBRATION_FRAMES,
         parent=None,
     ):
         super().__init__(parent)
@@ -318,14 +364,19 @@ class InferenceWorker(QThread):
         self.camera_width = camera_width
         self.camera_height = camera_height
         self.camera_fps = camera_fps
+        self.calibration_frames = max(30, int(calibration_frames))
         self.signals     = InferenceSignals()
         self._running    = True
         self._paused     = False
         self.threshold   = None
+        self._calibration_requested = False
+        self._calibrated = bool(alert_clip)
 
     def pause(self):  self._paused = True
     def resume(self): self._paused = False
     def stop(self):   self._running = False; self.wait(3000)
+    def start_calibration(self):
+        self._calibration_requested = True
 
     def run(self):
         # ── Config ────────────────────────────────────────────────────────────
@@ -416,6 +467,9 @@ class InferenceWorker(QThread):
         prob        = None
         t_prev      = time.perf_counter()
         fps_disp    = 0.0
+        calibration_raw = []
+        calibration_state = "ready" if self._calibrated else "waiting"
+        calibration_feature_state = LiveFeatureState(max_gap_fill=0)
 
         while self._running:
             if self._paused:
@@ -450,6 +504,73 @@ class InferenceWorker(QThread):
 
             face_ok = bool(result.face_landmarks)
             detected = extract_features(result.face_landmarks[0], W, H) if face_ok else None
+
+            if not self._calibrated:
+                if self._calibration_requested:
+                    if face_ok:
+                        raw = calibration_feature_state.update(detected)
+                        if raw is not None:
+                            calibration_raw.append(raw)
+                            display_raw = raw
+                        calibration_state = "calibrating"
+                        if len(calibration_raw) >= self.calibration_frames:
+                            norm_params = compute_norm_params_from_frames(calibration_raw)
+                            self._calibrated = True
+                            calibration_state = "ready"
+                            ring_buf.clear()
+                            prob_buf.clear()
+                            ear_history.clear()
+                            feature_state = LiveFeatureState(max_gap_fill=max_gap_fill)
+                            display_raw = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+                            feature_count = 0
+                            label = None
+                            prob = None
+                    else:
+                        calibration_state = "no_face"
+                else:
+                    calibration_state = "waiting"
+
+                self.signals.frame_ready.emit(frame, {
+                    "prob": None, "label": None,
+                    "ear_l": float(display_raw[0]), "ear_r": float(display_raw[1]),
+                    "ear_avg": float(display_raw[2]), "mar": float(display_raw[3]),
+                    "puc_l": float(display_raw[4]), "puc_r": float(display_raw[5]),
+                    "muc": float(display_raw[6]), "pitch": float(display_raw[7]),
+                    "yaw": float(display_raw[8]), "roll": float(display_raw[9]),
+                    "fps": fps_disp, "frame_count": frame_count,
+                    "perclos": 0.0, "face_detected": face_ok,
+                    "threshold": threshold, "warmup": True,
+                    "calibrated": self._calibrated,
+                    "calibration_state": calibration_state,
+                    "calibration_progress": min(1.0, len(calibration_raw) / self.calibration_frames),
+                })
+                continue
+
+            if not face_ok:
+                ring_buf.clear()
+                prob_buf.clear()
+                ear_history.clear()
+                feature_state = LiveFeatureState(max_gap_fill=max_gap_fill)
+                display_raw = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+                feature_count = 0
+                label = None
+                prob = None
+                self.signals.frame_ready.emit(frame, {
+                    "prob": None, "label": None,
+                    "ear_l": 0.0, "ear_r": 0.0,
+                    "ear_avg": 0.0, "mar": 0.0,
+                    "puc_l": 0.0, "puc_r": 0.0,
+                    "muc": 0.0, "pitch": 0.0,
+                    "yaw": 0.0, "roll": 0.0,
+                    "fps": fps_disp, "frame_count": frame_count,
+                    "perclos": 0.0, "face_detected": False,
+                    "threshold": threshold, "warmup": True,
+                    "calibrated": True,
+                    "calibration_state": "ready",
+                    "calibration_progress": 1.0,
+                })
+                continue
+
             raw = feature_state.update(detected)
 
             if raw is not None:
@@ -490,6 +611,9 @@ class InferenceWorker(QThread):
                 "fps": fps_disp, "frame_count": frame_count,
                 "perclos": perclos_est, "face_detected": face_ok,
                 "threshold": threshold, "warmup": prob is None,
+                "calibrated": True,
+                "calibration_state": "ready",
+                "calibration_progress": 1.0,
             }
             self.signals.frame_ready.emit(frame, metrics)
 
@@ -502,9 +626,12 @@ class InferenceWorker(QThread):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraWidget(QWidget):
+    calibration_requested = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
+        self._calibrate_rect = QRect()
         self._metrics = {
             "prob": None,
             "label": None,
@@ -513,6 +640,9 @@ class CameraWidget(QWidget):
             "warmup": True,
             "paused": False,
             "error": "",
+            "calibrated": False,
+            "calibration_state": "waiting",
+            "calibration_progress": 0.0,
         }
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(240, 180)
@@ -548,6 +678,9 @@ class CameraWidget(QWidget):
         warmup = bool(self._metrics.get("warmup"))
         paused = bool(self._metrics.get("paused"))
         error = str(self._metrics.get("error") or "")
+        calibrated = bool(self._metrics.get("calibrated"))
+        calibration_state = str(self._metrics.get("calibration_state") or "waiting")
+        calibration_progress = float(self._metrics.get("calibration_progress") or 0.0)
         prob = self._metrics.get("prob")
         risk = max(0.0, min(1.0, prob if prob is not None else 0.0))
         face_ok = bool(self._metrics.get("face_detected"))
@@ -563,7 +696,13 @@ class CameraWidget(QWidget):
         p.drawText(QRect(w - rec_w - margin, 0, rec_w, top_h), Qt.AlignVCenter | Qt.AlignRight, "REC")
 
         p.fillRect(0, h - bottom_h, w, bottom_h, QColor(0, 0, 0, 165))
-        if warmup:
+        if not calibrated:
+            status = "CAL" if tiny else "Normalize"
+            status_color = QColor(P["dimmer"])
+        elif not face_ok:
+            status = "NO FACE" if tiny else "No face"
+            status_color = QColor(P["amber"])
+        elif warmup:
             status = "WAIT" if tiny else "Warming up"
             status_color = QColor(P["dimmer"])
         elif label == 1:
@@ -575,7 +714,7 @@ class CameraWidget(QWidget):
 
         p.setFont(QFont("DejaVu Sans", 11 if tiny else (12 if compact else 17), QFont.Bold))
         p.setPen(status_color)
-        risk_text = f"{risk * 100:.0f}%" if tiny else f"Risk {risk * 100:.0f}%"
+        risk_text = "--" if not calibrated or not face_ok else (f"{risk * 100:.0f}%" if tiny else f"Risk {risk * 100:.0f}%")
         risk_w = 44 if tiny else (78 if compact else 104)
         status_rect = QRect(margin, h - bottom_h + 2, w - (2 * margin) - risk_w - 12, bottom_h - 12)
         p.drawText(status_rect, Qt.AlignVCenter | Qt.AlignLeft, status)
@@ -590,7 +729,8 @@ class CameraWidget(QWidget):
         bar_y = h - 8 if tiny else (h - 12 if compact else h - 16)
         bar_h = 4 if tiny else (5 if compact else 7)
         p.fillRect(bar_x, bar_y, bar_w, bar_h, QColor(90, 90, 90, 170))
-        p.fillRect(bar_x, bar_y, int(bar_w * risk), bar_h, status_color)
+        if calibrated and face_ok:
+            p.fillRect(bar_x, bar_y, int(bar_w * risk), bar_h, status_color)
 
         if not tiny:
             small = f"FPS {fps:.0f}   Face {'yes' if face_ok else 'no'}"
@@ -617,8 +757,14 @@ class CameraWidget(QWidget):
             p.setPen(QColor("#ffffff"))
             p.drawText(QRect(0, pause_y, w, pause_h), Qt.AlignCenter, "PAUSED")
 
+        if not calibrated:
+            self._draw_calibration_overlay(
+                p, w, h, compact, tiny, face_ok,
+                calibration_state, calibration_progress,
+            )
+
         alert_text = "ALERT" if compact else "DROWSINESS ALERT"
-        if label == 1 and not warmup and not paused:
+        if label == 1 and calibrated and face_ok and not warmup and not paused:
             alert_h = 44 if compact else 64
             alert_y = max(top_h + 6, h // 2 - alert_h // 2)
             p.fillRect(0, alert_y, w, alert_h, QColor(P["red"]))
@@ -626,6 +772,59 @@ class CameraWidget(QWidget):
             p.setPen(QColor("#ffffff"))
             p.drawText(QRect(0, alert_y, w, alert_h), Qt.AlignCenter, alert_text)
         p.end()
+
+    def _draw_calibration_overlay(self, p, w, h, compact, tiny, face_ok, state, progress):
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 150))
+        panel_w = min(w - 28, 420 if not compact else 320)
+        panel_h = 170 if not tiny else 132
+        panel_x = max(14, (w - panel_w) // 2)
+        panel_y = max(38, (h - panel_h) // 2)
+        panel = QRect(panel_x, panel_y, panel_w, panel_h)
+        p.fillRect(panel, QColor(10, 10, 10, 215))
+
+        title = "NORMALIZE" if tiny else "Normalize Driver"
+        p.setFont(QFont("DejaVu Sans", 15 if tiny else 20, QFont.Bold))
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRect(panel_x, panel_y + 14, panel_w, 34), Qt.AlignCenter, title)
+
+        if state == "waiting":
+            message = "Face forward, eyes open"
+        elif state == "no_face":
+            message = "Face not found"
+        else:
+            message = "Hold still"
+        p.setFont(QFont("DejaVu Sans", 9 if tiny else 12, QFont.Bold))
+        p.setPen(QColor(P["green"] if face_ok else P["amber"]))
+        p.drawText(QRect(panel_x + 10, panel_y + 50, panel_w - 20, 28), Qt.AlignCenter, message)
+
+        button_w = min(panel_w - 36, 300)
+        button_h = 42 if tiny else 50
+        button_x = panel_x + (panel_w - button_w) // 2
+        button_y = panel_y + panel_h - button_h - 18
+        button = QRect(button_x, button_y, button_w, button_h)
+
+        if state == "waiting":
+            self._calibrate_rect = button
+            p.fillRect(button, QColor(P["green"]))
+            p.setFont(QFont("DejaVu Sans", 12 if tiny else 15, QFont.Bold))
+            p.setPen(QColor("#ffffff"))
+            p.drawText(button, Qt.AlignCenter, "START")
+            return
+
+        self._calibrate_rect = QRect()
+        bar = QRect(button_x, button_y + button_h // 2 - 4, button_w, 8)
+        p.fillRect(bar, QColor(80, 80, 80, 220))
+        p.fillRect(bar.x(), bar.y(), int(bar.width() * max(0.0, min(1.0, progress))), bar.height(), QColor(P["green"]))
+        pct = int(max(0.0, min(1.0, progress)) * 100)
+        p.setFont(QFont("DejaVu Sans", 10 if tiny else 12, QFont.Bold))
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRect(button_x, button_y - 18, button_w, 18), Qt.AlignCenter, f"{pct}%")
+
+    def mousePressEvent(self, event):
+        if self._calibrate_rect.isValid() and self._calibrate_rect.contains(event.pos()):
+            self.calibration_requested.emit()
+            return
+        super().mousePressEvent(event)
 
 
 GLOBAL_QSS = f"""
@@ -660,6 +859,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         self.cam_widget = CameraWidget()
+        self.cam_widget.calibration_requested.connect(self._start_normalization)
         root.addWidget(self.cam_widget)
 
     def _start_worker(self):
@@ -667,12 +867,14 @@ class MainWindow(QMainWindow):
         camera_width = getattr(self.args, 'camera_width', 640)
         camera_height = getattr(self.args, 'camera_height', 480)
         camera_fps = getattr(self.args, 'camera_fps', 30)
+        calibration_frames = getattr(self.args, 'calibration_frames', DEFAULT_CALIBRATION_FRAMES)
         if INFERENCE_AVAILABLE:
             model = getattr(self.args, 'model', str(DEFAULT_MODEL))
             clip = getattr(self.args, 'alert_clip', None)
             stride = getattr(self.args, 'predict_stride', None)
             self.worker = InferenceWorker(
-                source, model, clip, stride, camera_width, camera_height, camera_fps
+                source, model, clip, stride, camera_width, camera_height, camera_fps,
+                calibration_frames
             )
         else:
             self.worker = DemoWorker(source, camera_width, camera_height, camera_fps)
@@ -680,6 +882,20 @@ class MainWindow(QMainWindow):
         self.worker.signals.frame_ready.connect(self._on_frame)
         self.worker.signals.error.connect(self._on_error)
         self.worker.start()
+
+    def _start_normalization(self):
+        self._last_error = ""
+        if hasattr(self.worker, "start_calibration"):
+            self.worker.start_calibration()
+        metrics = dict(self.cam_widget._metrics)
+        metrics.update({
+            "prob": None,
+            "label": None,
+            "calibrated": False,
+            "calibration_state": "calibrating",
+            "calibration_progress": 0.0,
+        })
+        self.cam_widget.set_metrics(metrics)
 
     def _on_frame(self, frame, metrics):
         self.cam_widget.set_frame(frame)
@@ -699,6 +915,9 @@ class MainWindow(QMainWindow):
             "warmup": False,
             "paused": self._paused,
             "error": self._last_error,
+            "calibrated": bool(self.cam_widget._metrics.get("calibrated")),
+            "calibration_state": self.cam_widget._metrics.get("calibration_state", "waiting"),
+            "calibration_progress": self.cam_widget._metrics.get("calibration_progress", 0.0),
         })
 
     def _toggle_pause(self):
@@ -751,6 +970,8 @@ def parse_args():
                     help="Picamera2 capture height for numeric camera sources")
     ap.add_argument("--camera-fps", type=int, default=30,
                     help="Requested Picamera2 frame rate for numeric camera sources")
+    ap.add_argument("--calibration-frames", type=int, default=DEFAULT_CALIBRATION_FRAMES,
+                    help="Detected face frames to collect for startup normalization")
     ap.add_argument("--qt-platform", default=None,
                     choices=["xcb", "wayland", "eglfs", "linuxfb", "offscreen", "minimal"],
                     help="Override Qt platform plugin if auto-detection is wrong")
