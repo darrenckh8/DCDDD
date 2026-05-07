@@ -7,7 +7,7 @@ Designed for Raspberry Pi 5 (Bookworm) + capacitive display (1024×600).
 
 Install
 -------
-  sudo apt install python3-pyqt5
+  sudo apt install python3-pyqt5 python3-picamera2
   # or: pip install PyQt5 --break-system-packages
 
 Usage
@@ -34,6 +34,13 @@ except ModuleNotFoundError as exc:
         f"Missing dependency '{exc.name}'. "
         "Activate your project virtualenv and install required packages."
     ) from exc
+
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except ModuleNotFoundError:
+    Picamera2 = None
+    PICAMERA2_AVAILABLE = False
 
 try:
     from PyQt5.QtCore import (
@@ -115,6 +122,89 @@ def qc(key):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  FRAME SOURCES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _camera_index(source):
+    raw = str(source).strip()
+    if Path(raw).exists():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+class Picamera2Capture:
+    """BGR frame source backed by Picamera2 for Raspberry Pi cameras."""
+
+    def __init__(self, camera_index=0, width=640, height=480, fps=30):
+        if not PICAMERA2_AVAILABLE:
+            raise RuntimeError(
+                "Picamera2 is not installed. On Raspberry Pi OS Bookworm, run: "
+                "sudo apt install python3-picamera2"
+            )
+        self.fps = float(fps) if fps else 30.0
+        self.loop_source = False
+        self._camera = Picamera2(camera_num=int(camera_index))
+        config = self._camera.create_video_configuration(
+            main={"size": (int(width), int(height)), "format": "RGB888"},
+        )
+        self._camera.configure(config)
+        try:
+            self._camera.set_controls({"FrameRate": self.fps})
+        except Exception:
+            pass
+        self._camera.start()
+
+    def read(self):
+        frame = self._camera.capture_array()
+        if frame is None:
+            return False, None
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        else:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return True, frame
+
+    def reset(self):
+        return None
+
+    def release(self):
+        try:
+            self._camera.stop()
+        finally:
+            self._camera.close()
+
+
+class OpenCVVideoCapture:
+    """BGR frame source backed by OpenCV for video files/devices."""
+
+    def __init__(self, source):
+        self._cap = cv2.VideoCapture(source)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open: {source}")
+        self.fps = float(self._cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        self.loop_source = not isinstance(source, int)
+
+    def read(self):
+        return self._cap.read()
+
+    def reset(self):
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    def release(self):
+        self._cap.release()
+
+
+def open_frame_source(source, camera_width=640, camera_height=480, camera_fps=30):
+    index = _camera_index(source)
+    if index is not None:
+        return Picamera2Capture(index, camera_width, camera_height, camera_fps)
+    return OpenCVVideoCapture(str(source))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  INFERENCE WORKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -125,8 +215,12 @@ class InferenceSignals(QObject):
 
 class DemoWorker(QThread):
     """Generates synthetic data when live_inference is unavailable."""
-    def __init__(self, parent=None):
+    def __init__(self, source="0", camera_width=640, camera_height=480, camera_fps=30, parent=None):
         super().__init__(parent)
+        self.source = source
+        self.camera_width = camera_width
+        self.camera_height = camera_height
+        self.camera_fps = camera_fps
         self.signals  = InferenceSignals()
         self._running = True
         self._paused  = False
@@ -139,12 +233,20 @@ class DemoWorker(QThread):
     def run(self):
         t = 0.0
         fc = 0
-        cap = cv2.VideoCapture(0)
+        try:
+            cap = open_frame_source(
+                self.source,
+                self.camera_width,
+                self.camera_height,
+                self.camera_fps,
+            )
+        except Exception:
+            cap = None
         while self._running:
             if self._paused:
                 time.sleep(0.05); continue
             t += 0.033; fc += 1
-            ok, frame = cap.read()
+            ok, frame = cap.read() if cap is not None else (False, None)
             if not ok:
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(frame, "NO CAMERA — DEMO MODE",
@@ -174,16 +276,30 @@ class DemoWorker(QThread):
             }
             self.signals.frame_ready.emit(frame, metrics)
             time.sleep(0.033)
-        cap.release()
+        if cap is not None:
+            cap.release()
 
 
 class InferenceWorker(QThread):
-    def __init__(self, source, model_path, alert_clip=None, predict_stride=None, parent=None):
+    def __init__(
+        self,
+        source,
+        model_path,
+        alert_clip=None,
+        predict_stride=None,
+        camera_width=640,
+        camera_height=480,
+        camera_fps=30,
+        parent=None,
+    ):
         super().__init__(parent)
         self.source      = source
         self.model_path  = model_path
         self.alert_clip  = alert_clip
         self.predict_stride = predict_stride
+        self.camera_width = camera_width
+        self.camera_height = camera_height
+        self.camera_fps = camera_fps
         self.signals     = InferenceSignals()
         self._running    = True
         self._paused     = False
@@ -257,21 +373,18 @@ class InferenceWorker(QThread):
             landmarker.close(); return
 
         # ── Open source ───────────────────────────────────────────────────────
-        source_raw = str(self.source).strip()
-        src = source_raw
-        if not Path(source_raw).exists():
-            try:
-                src = int(source_raw)
-            except ValueError:
-                src = source_raw
-
-        cap = cv2.VideoCapture(src)
-        if not cap.isOpened():
-            self.signals.error.emit(f"Cannot open: {self.source}")
+        try:
+            cap = open_frame_source(
+                self.source,
+                self.camera_width,
+                self.camera_height,
+                self.camera_fps,
+            )
+        except Exception as e:
+            self.signals.error.emit(f"Source: {e}")
             landmarker.close(); return
 
-        cam_fps  = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        loop_source = not isinstance(src, int)
+        cam_fps = cap.fps
 
         ring_buf    = collections.deque(maxlen=padded_len)
         prob_buf    = collections.deque(maxlen=smooth_k)
@@ -292,8 +405,8 @@ class InferenceWorker(QThread):
 
             ok, frame = cap.read()
             if not ok:
-                if loop_source:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if cap.loop_source:
+                    cap.reset()
                     ring_buf.clear()
                     prob_buf.clear()
                     ear_history.clear()
@@ -1062,14 +1175,25 @@ class MainWindow(QMainWindow):
     # ── Worker lifecycle ──────────────────────────────────────────────────────
 
     def _start_worker(self):
+        source = getattr(self.args, 'source', '0')
+        camera_width = getattr(self.args, 'camera_width', 640)
+        camera_height = getattr(self.args, 'camera_height', 480)
+        camera_fps = getattr(self.args, 'camera_fps', 30)
         if INFERENCE_AVAILABLE:
             model  = getattr(self.args, 'model', str(DEFAULT_MODEL))
-            source = getattr(self.args, 'source', '0')
             clip   = getattr(self.args, 'alert_clip', None)
             stride = getattr(self.args, 'predict_stride', None)
-            self.worker = InferenceWorker(source, model, clip, stride)
+            self.worker = InferenceWorker(
+                source,
+                model,
+                clip,
+                stride,
+                camera_width,
+                camera_height,
+                camera_fps,
+            )
         else:
-            self.worker = DemoWorker()
+            self.worker = DemoWorker(source, camera_width, camera_height, camera_fps)
 
         self.worker.signals.frame_ready.connect(self._on_frame)
         self.worker.signals.error.connect(self._on_error)
