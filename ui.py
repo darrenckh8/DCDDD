@@ -49,18 +49,15 @@ except ModuleNotFoundError:
 
 try:
     from PyQt5.QtCore import (
-        Qt, QThread, QTimer, pyqtSignal, QObject, QRect, QPointF,
-        QRectF, QSizeF, QLibraryInfo
+        Qt, QThread, QTimer, pyqtSignal, QObject, QRect, QLibraryInfo
     )
     from PyQt5.QtGui import (
-        QImage, QPixmap, QPainter, QColor, QFont, QPen, QBrush,
-        QLinearGradient, QConicalGradient, QRadialGradient, QPainterPath,
-        QFontMetrics
+        QImage, QPixmap, QPainter, QColor, QFont
     )
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QLabel, QPushButton,
         QVBoxLayout, QHBoxLayout, QGridLayout, QFrame,
-        QSizePolicy, QStackedWidget, QScrollArea
+        QSizePolicy, QProgressBar, QListWidget, QListWidgetItem
     )
 except ModuleNotFoundError as exc:
     raise SystemExit(
@@ -102,29 +99,25 @@ except (ImportError, SystemExit) as _e:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 P = {
-    "bg":         "#06100c",
-    "bg2":        "#0b1a14",
-    "bg3":        "#0f211a",
-    "surface":    "#122118",
-    "border":     "#1e3329",
-    "border_hi":  "#2a4a3a",
-    "green":      "#00e87a",
-    "green_dim":  "#007a3f",
-    "green_mid":  "#00b05c",
-    "red":        "#ff2d2d",
-    "red_dim":    "#7a1515",
-    "amber":      "#ffb300",
-    "amber_dim":  "#7a5500",
-    "cyan":       "#00d4e8",
-    "white":      "#d8ede6",
-    "dim":        "#4a6a5a",
-    "dimmer":     "#2a3d34",
-    "scanline":   "#00150d",
+    "bg":         "#202124",
+    "bg2":        "#262a2e",
+    "bg3":        "#30353a",
+    "surface":    "#2b3035",
+    "border":     "#3d444b",
+    "border_hi":  "#555e66",
+    "green":      "#2e7d32",
+    "green_dim":  "#1f5f25",
+    "green_mid":  "#43a047",
+    "red":        "#c62828",
+    "red_dim":    "#8e1b1b",
+    "amber":      "#f9a825",
+    "amber_dim":  "#8a6518",
+    "cyan":       "#1976d2",
+    "white":      "#f1f3f4",
+    "dim":        "#a8b0b8",
+    "dimmer":     "#7b848d",
+    "scanline":   "#17191c",
 }
-
-def qc(key):
-    return QColor(P[key])
-
 
 def configure_qt_environment(qt_platform=None):
     """Keep OpenCV's bundled Qt plugins from hijacking PyQt startup."""
@@ -506,513 +499,308 @@ class InferenceWorker(QThread):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CUSTOM WIDGETS
+#  MODEST DASHCAM UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SectionHeader(QLabel):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
-        self.setStyleSheet(f"""
-            color: {P['dim']};
-            font-size: 8px;
-            font-weight: bold;
-            font-family: 'DejaVu Sans Mono', monospace;
-            letter-spacing: 2px;
-            padding-bottom: 2px;
-        """)
+        self.setObjectName("sectionHeader")
 
 
-class CornerFrame(QWidget):
-    """Dark frame with corner bracket decorations."""
+class CornerFrame(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
-        w, h = self.width(), self.height()
-        cs   = 8   # corner size
-
-        p.fillRect(0, 0, w, h, qc("bg2"))
-
-        # Subtle border
-        p.setPen(QPen(qc("border"), 1))
-        p.drawRect(0, 0, w - 1, h - 1)
-
-        # Corner accents
-        p.setPen(QPen(qc("green_dim"), 1))
-        for (x, y, dx, dy) in [
-            (0, 0,  1, 1), (w-1, 0,  -1, 1),
-            (0, h-1, 1, -1), (w-1, h-1, -1, -1)
-        ]:
-            p.drawLine(x, y, x + dx * cs, y)
-            p.drawLine(x, y, x, y + dy * cs)
-        p.end()
+        self.setObjectName("panel")
+        self.setFrameShape(QFrame.StyledPanel)
 
 
 class DrowsinessGauge(QWidget):
-    """Large arc gauge showing drowsiness probability."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.prob   = 0.0
-        self.label  = None
-        self.thresh = 0.5
-        self._pulse = 0.0
-        self.setMinimumSize(150, 150)
+        self.setMinimumHeight(145)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(40)
+        self.status_lbl = QLabel("Initializing")
+        self.status_lbl.setObjectName("driverStatus")
+        self.status_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.status_lbl)
+
+        self.prob_lbl = QLabel("Risk 0%")
+        self.prob_lbl.setObjectName("probLabel")
+        self.prob_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.prob_lbl)
+
+        self.prob_bar = QProgressBar()
+        self.prob_bar.setRange(0, 100)
+        self.prob_bar.setTextVisible(False)
+        self.prob_bar.setFixedHeight(14)
+        lay.addWidget(self.prob_bar)
+
+        self.threshold_lbl = QLabel("Threshold --")
+        self.threshold_lbl.setObjectName("mutedLabel")
+        self.threshold_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.threshold_lbl)
 
     def set_data(self, prob, label, thresh):
-        self.prob   = prob if prob is not None else 0.0
-        self.label  = label
-        self.thresh = thresh
-        self.update()
-
-    def _tick(self):
-        if self.label == 1:
-            self._pulse = (self._pulse + 0.12) % (2 * math.pi)
-            self.update()
-        elif self._pulse != 0.0:
-            self._pulse = 0.0
-            self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
-        r  = min(w, h) / 2 - 14
-
-        # ── Pulsing outer ring (drowsy state) ─────────────────────────────────
-        if self.label == 1:
-            alpha = int(80 + 60 * abs(math.sin(self._pulse)))
-            pulse_pen = QPen(QColor(255, 45, 45, alpha), 2)
-            pulse_pen.setStyle(Qt.DashLine)
-            p.setPen(pulse_pen)
-            p.setBrush(Qt.NoBrush)
-            pr = r + 10 + 3 * abs(math.sin(self._pulse))
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
-
-        # ── Track arc ─────────────────────────────────────────────────────────
-        track_pen = QPen(qc("bg3"), 10, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(track_pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawArc(QRectF(cx - r, cy - r, r * 2, r * 2),
-                  int(225 * 16), int(-270 * 16))
-
-        # ── Filled arc ────────────────────────────────────────────────────────
-        if self.label is None:
-            arc_col = QColor(P["dim"])
-        elif self.label == 1:
-            arc_col = QColor(P["red"])
-        elif self.prob > 0.65:
-            arc_col = QColor(P["amber"])
-        elif self.prob > 0.4:
-            # blend amber → green
-            t = (self.prob - 0.4) / 0.25
-            arc_col = QColor(
-                int(255 * t), int(179 - 179 * t + 184 * (1 - t)), 0
-            )
+        risk = max(0.0, min(1.0, prob if prob is not None else 0.0))
+        if label is None:
+            status, color = "Warming up", P["dimmer"]
+        elif label == 1:
+            status, color = "Drowsiness detected", P["red"]
         else:
-            arc_col = QColor(P["green"])
+            status, color = "Driver alert", P["green"]
 
-        fill_pen = QPen(arc_col, 10, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(fill_pen)
-        span = -int(270 * 16 * self.prob)
-        if span != 0:
-            p.drawArc(QRectF(cx - r, cy - r, r * 2, r * 2),
-                      int(225 * 16), span)
-
-        # ── Threshold tick ────────────────────────────────────────────────────
-        thr_ang = math.radians(225 - 270 * self.thresh)
-        tick_r1, tick_r2 = r - 6, r + 6
-        p.setPen(QPen(QColor(P["white"]), 1))
-        p.drawLine(
-            QPointF(cx + tick_r1 * math.cos(thr_ang), cy - tick_r1 * math.sin(thr_ang)),
-            QPointF(cx + tick_r2 * math.cos(thr_ang), cy - tick_r2 * math.sin(thr_ang)),
+        self.status_lbl.setText(status)
+        self.status_lbl.setStyleSheet(f"color: {color};")
+        self.prob_lbl.setText(f"Risk {risk * 100:.0f}%")
+        self.threshold_lbl.setText(f"Threshold {thresh:.2f}")
+        self.prob_bar.setValue(int(round(risk * 100)))
+        self.prob_bar.setStyleSheet(
+            "QProgressBar { background: %s; border: 1px solid %s; border-radius: 4px; }"
+            "QProgressBar::chunk { background: %s; border-radius: 4px; }"
+            % (P["bg3"], P["border"], color)
         )
-
-        # ── Inner circle ──────────────────────────────────────────────────────
-        inner = r - 16
-        p.setPen(Qt.NoPen)
-        radial = QRadialGradient(cx, cy, inner)
-        radial.setColorAt(0.0, QColor(P["bg3"]))
-        radial.setColorAt(1.0, QColor(P["bg2"]))
-        p.setBrush(QBrush(radial))
-        p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
-
-        # ── Status text ───────────────────────────────────────────────────────
-        if self.label is None:
-            txt, col, fsz = "INIT", P["dim"], 11
-        elif self.label == 1:
-            txt, col, fsz = "DROWSY", P["red"], 13
-        else:
-            txt, col, fsz = "ALERT", P["green"], 14
-
-        p.setFont(QFont("DejaVu Sans Mono", fsz, QFont.Bold))
-        p.setPen(QColor(col))
-        p.drawText(QRectF(cx - inner, cy - 16, inner * 2, 28),
-                   Qt.AlignCenter, txt)
-
-        # ── Probability value ─────────────────────────────────────────────────
-        p.setFont(QFont("DejaVu Sans Mono", 8))
-        p.setPen(QColor(P["dim"]))
-        p.drawText(QRectF(cx - inner, cy + 10, inner * 2, 16),
-                   Qt.AlignCenter, f"p = {self.prob:.3f}")
-
-        p.end()
 
 
 class GaugeBar(QWidget):
-    """Compact horizontal gauge with bracket label."""
     def __init__(self, label, lo=0.0, hi=1.0, danger_lo=None, danger_hi=None, parent=None):
         super().__init__(parent)
-        self.label      = label
-        self.lo, self.hi = lo, hi
-        self.danger_lo  = danger_lo
-        self.danger_hi  = danger_hi
-        self.value      = (lo + hi) / 2
-        self.alert      = False
-        self.setFixedHeight(26)
+        self.lo = lo
+        self.hi = hi
+        self.danger_lo = danger_lo
+        self.danger_hi = danger_hi
+        self.setFixedHeight(30)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        self.name_lbl = QLabel(label)
+        self.name_lbl.setObjectName("metricName")
+        self.name_lbl.setFixedWidth(76)
+        lay.addWidget(self.name_lbl)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        lay.addWidget(self.bar, 1)
+
+        self.value_lbl = QLabel("0.000")
+        self.value_lbl.setObjectName("metricValue")
+        self.value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.value_lbl.setFixedWidth(58)
+        lay.addWidget(self.value_lbl)
 
     def set_value(self, v):
-        self.value = max(self.lo, min(self.hi, v))
-        self.alert = (
+        if v is None or not np.isfinite(v):
+            v = 0.0
+        clamped = max(self.lo, min(self.hi, float(v)))
+        ratio = (clamped - self.lo) / max(self.hi - self.lo, 1e-6)
+        alert = (
             (self.danger_lo is not None and v < self.danger_lo) or
             (self.danger_hi is not None and v > self.danger_hi)
         )
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-
-        lw    = 64
-        bar_x = lw + 4
-        bar_w = w - bar_x - 40
-        bar_h = 5
-        bar_y = h // 2 - bar_h // 2
-
-        # Label
-        p.setFont(QFont("DejaVu Sans Mono", 7, QFont.Bold))
-        p.setPen(qc("dim"))
-        p.drawText(QRect(0, 0, lw, h), Qt.AlignVCenter | Qt.AlignLeft, self.label)
-
-        # Track
-        p.setPen(Qt.NoPen)
-        p.setBrush(qc("bg3"))
-        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 2, 2)
-
-        # Fill
-        ratio = (self.value - self.lo) / max(self.hi - self.lo, 1e-6)
-        fw    = int(bar_w * ratio)
-        color = P["red"] if self.alert else P["green"]
-        if fw > 0:
-            grad = QLinearGradient(bar_x, 0, bar_x + fw, 0)
-            if self.alert:
-                grad.setColorAt(0, QColor(P["red_dim"]))
-                grad.setColorAt(1, QColor(P["red"]))
-            else:
-                grad.setColorAt(0, QColor(P["green_dim"]))
-                grad.setColorAt(1, QColor(P["green_mid"]))
-            p.setBrush(QBrush(grad))
-            p.drawRoundedRect(bar_x, bar_y, fw, bar_h, 2, 2)
-
-        # Value
-        p.setFont(QFont("DejaVu Sans Mono", 8))
-        p.setPen(QColor(color if self.alert else P["white"]))
-        p.drawText(QRect(bar_x + bar_w + 4, 0, 36, h),
-                   Qt.AlignVCenter | Qt.AlignRight, f"{self.value:.3f}")
-
-        p.end()
+        color = P["red"] if alert else P["cyan"]
+        self.value_lbl.setText(f"{v:.3f}")
+        self.value_lbl.setStyleSheet(f"color: {color};")
+        self.bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
+        self.bar.setStyleSheet(
+            "QProgressBar { background: %s; border: none; border-radius: 4px; }"
+            "QProgressBar::chunk { background: %s; border-radius: 4px; }"
+            % (P["bg3"], color)
+        )
 
 
 class HeadPoseWidget(QWidget):
-    """Three mini axis bars: Pitch / Yaw / Roll."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.pitch = self.yaw = self.roll = 0.0
-        self.setFixedHeight(62)
+        lay = QGridLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setHorizontalSpacing(12)
+        lay.setVerticalSpacing(4)
+        self.values = {}
+        for col, name in enumerate(("Pitch", "Yaw", "Roll")):
+            title = QLabel(name)
+            title.setObjectName("metricName")
+            value = QLabel("+0.0 deg")
+            value.setObjectName("poseValue")
+            value.setAlignment(Qt.AlignCenter)
+            lay.addWidget(title, 0, col, Qt.AlignCenter)
+            lay.addWidget(value, 1, col, Qt.AlignCenter)
+            self.values[name.lower()] = value
 
     def set_pose(self, pitch, yaw, roll):
-        self.pitch, self.yaw, self.roll = pitch, yaw, roll
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        col_w = w // 3
-
-        for i, (lbl, val) in enumerate([("PITCH", self.pitch),
-                                         ("YAW",   self.yaw),
-                                         ("ROLL",  self.roll)]):
-            cx = col_w * i + col_w // 2
-            bw = col_w - 14
-            bh = 5
-            by = h // 2 - bh // 2 + 6
-
-            # Label
-            p.setFont(QFont("DejaVu Sans Mono", 7, QFont.Bold))
-            p.setPen(qc("dim"))
-            p.drawText(QRect(col_w * i, 0, col_w, 14), Qt.AlignCenter, lbl)
-
-            # Track
-            p.setPen(Qt.NoPen)
-            p.setBrush(qc("bg3"))
-            p.drawRoundedRect(cx - bw // 2, by, bw, bh, 2, 2)
-
-            # Centered fill
-            ratio  = max(-1.0, min(1.0, val / 45.0))
-            half   = bw // 2
-            fw     = int(half * abs(ratio))
-            color  = P["amber"] if abs(val) > 25 else P["cyan"]
-            p.setBrush(QColor(color))
-            if fw > 0:
-                if ratio < 0:
-                    p.drawRoundedRect(cx - fw, by, fw, bh, 2, 2)
-                else:
-                    p.drawRoundedRect(cx, by, fw, bh, 2, 2)
-
-            # Center notch
-            p.setPen(QPen(qc("border_hi"), 1))
-            p.drawLine(cx, by - 2, cx, by + bh + 2)
-
-            # Value
-            p.setFont(QFont("DejaVu Sans Mono", 7))
-            p.setPen(QColor(color))
-            p.drawText(QRect(col_w * i, by + bh + 3, col_w, 14),
-                       Qt.AlignCenter, f"{val:+.1f}°")
-
-        p.end()
+        self.values["pitch"].setText(f"{pitch:+.1f} deg")
+        self.values["yaw"].setText(f"{yaw:+.1f} deg")
+        self.values["roll"].setText(f"{roll:+.1f} deg")
 
 
 class AlertLogWidget(QWidget):
-    """Scrolling event log panel."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.entries     = []
         self._start_time = time.time()
-        self.setMinimumHeight(70)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(SectionHeader("Events"))
+        self.list_widget = QListWidget()
+        self.list_widget.setObjectName("eventList")
+        lay.addWidget(self.list_widget)
 
     def add_event(self, msg, level=1):
         elapsed = time.time() - self._start_time
-        ts      = f"{int(elapsed)//60:02d}:{int(elapsed)%60:02d}"
-        self.entries.append((ts, msg, level))
-        if len(self.entries) > 60:
-            self.entries.pop(0)
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, qc("bg2"))
-        p.setPen(QPen(qc("border"), 1))
-        p.drawRect(0, 0, w - 1, h - 1)
-
-        # Header
-        p.setFont(QFont("DejaVu Sans Mono", 7, QFont.Bold))
-        p.setPen(qc("dim"))
-        p.drawText(6, 13, "EVENT LOG")
-
-        lh      = 13
-        visible = max(0, (h - 18) // lh)
-        shown   = self.entries[-visible:]
-
-        level_colors = {0: P["green"], 1: P["amber"], 2: P["red"]}
-        for i, (ts, msg, lv) in enumerate(reversed(shown)):
-            y = h - 5 - i * lh
-            p.setFont(QFont("DejaVu Sans Mono", 7))
-            p.setPen(QColor(P["dimmer"])); p.drawText(6,  y, ts)
-            p.setPen(QColor(level_colors.get(lv, P["white"])))
-            # Truncate long messages
-            fm  = QFontMetrics(p.font())
-            txt = fm.elidedText(msg, Qt.ElideRight, w - 58)
-            p.drawText(50, y, txt)
-
-        p.end()
+        ts = f"{int(elapsed)//60:02d}:{int(elapsed)%60:02d}"
+        item = QListWidgetItem(f"{ts}  {msg}")
+        item.setForeground(QColor({0: P["green"], 1: P["amber"], 2: P["red"]}.get(level, P["white"])))
+        self.list_widget.insertItem(0, item)
+        while self.list_widget.count() > 80:
+            self.list_widget.takeItem(self.list_widget.count() - 1)
 
 
 class FaceStatusWidget(QWidget):
-    """Compact face detection + FPS strip."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.fps    = 0.0
-        self.frames = 0
-        self.face   = False
-        self.setFixedHeight(32)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        self.fps_lbl = QLabel("FPS --")
+        self.frames_lbl = QLabel("Frames 0")
+        self.face_lbl = QLabel("Face no")
+        for label in (self.fps_lbl, self.frames_lbl, self.face_lbl):
+            label.setObjectName("statusItem")
+            lay.addWidget(label)
+        lay.addStretch()
 
     def update_data(self, fps, frames, face):
-        self.fps = fps; self.frames = frames; self.face = face
-        self.update()
+        self.fps_lbl.setText(f"FPS {fps:.1f}")
+        self.frames_lbl.setText(f"Frames {frames:,}")
+        self.face_lbl.setText("Face yes" if face else "Face no")
+        self.face_lbl.setStyleSheet(f"color: {P['green'] if face else P['amber']};")
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, qc("bg2"))
-
-        def tag(x, label, val, color):
-            p.setFont(QFont("DejaVu Sans Mono", 7, QFont.Bold))
-            p.setPen(qc("dim"))
-            p.drawText(x, 0, 50, h, Qt.AlignVCenter | Qt.AlignLeft, label)
-            p.setFont(QFont("DejaVu Sans Mono", 9))
-            p.setPen(QColor(color))
-            p.drawText(x + 48, 0, 70, h, Qt.AlignVCenter | Qt.AlignLeft, val)
-
-        tag(6,         "FPS",    f"{self.fps:.1f}",   P["white"])
-        tag(w // 3,    "FRAMES", f"{self.frames:,}",  P["white"])
-        tag(2*w//3,    "FACE",   "◈ YES" if self.face else "○ NO",
-            P["green"] if self.face else P["amber"])
-
-        p.end()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CAMERA WIDGET  (with HUD overlay)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraWidget(QWidget):
-    """Displays the camera frame with a subtle scan-line / corner HUD overlay."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pixmap    = None
-        self._label     = None   # None | 0 | 1
-        self._warmup    = True
-        self._anim      = 0.0
+        self._pixmap = None
+        self._label = None
+        self._warmup = True
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(320, 240)
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(50)
+        self.setMinimumSize(420, 300)
 
     def set_frame(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
-        rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        qi   = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        qi = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(qi)
         self.update()
 
     def set_status(self, label, warmup):
-        self._label  = label
+        self._label = label
         self._warmup = warmup
         self.update()
-
-    def _tick(self):
-        if self._label == 1:
-            self._anim = (self._anim + 0.15) % (2 * math.pi)
-            self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor("#050505"))
 
-        # Camera frame
         if self._pixmap:
-            scaled = self._pixmap.scaled(
-                w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            ox = (w - scaled.width())  // 2
+            scaled = self._pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            ox = (w - scaled.width()) // 2
             oy = (h - scaled.height()) // 2
             p.drawPixmap(ox, oy, scaled)
-        else:
-            p.fillRect(0, 0, w, h, QColor("#000"))
 
-        # Scan-line overlay
-        p.setPen(Qt.NoPen)
-        for y in range(0, h, 4):
-            p.fillRect(0, y, w, 1, QColor(0, 0, 0, 18))
+        p.fillRect(0, 0, w, 34, QColor(0, 0, 0, 145))
+        p.setFont(QFont("DejaVu Sans", 10, QFont.Bold))
+        p.setPen(QColor("#ffffff"))
+        p.drawText(12, 22, time.strftime("%Y-%m-%d  %H:%M:%S"))
+        p.setPen(QColor(P["red"]))
+        p.drawText(w - 58, 22, "REC")
 
-        # Corner brackets
-        cs  = 20
-        brd = 8
-        col = P["red"] if self._label == 1 else P["green_dim"]
-        if self._label == 1:
-            alpha = int(160 + 80 * abs(math.sin(self._anim)))
-            col_q = QColor(P["red"])
-            col_q.setAlpha(alpha)
-        else:
-            col_q = QColor(col)
-
-        pen = QPen(col_q, 2)
-        p.setPen(pen)
-        for (x, y, sx, sy) in [
-            (brd, brd, 1, 1), (w - brd, brd, -1, 1),
-            (brd, h - brd, 1, -1), (w - brd, h - brd, -1, -1)
-        ]:
-            p.drawLine(x, y, x + sx * cs, y)
-            p.drawLine(x, y, x, y + sy * cs)
-
-        # Status overlay banner
         if self._warmup:
-            banner_text = "⬡  WARMING UP..."
-            banner_col  = QColor(P["dim"])
-            bg_col      = QColor(0, 0, 0, 140)
+            banner_text = "Warming up..."
+            banner_col = QColor(P["white"])
+            bg_col = QColor(0, 0, 0, 150)
         elif self._label == 1:
-            pulse_a = int(180 + 60 * abs(math.sin(self._anim)))
-            banner_text = "⚠  DROWSINESS DETECTED"
-            banner_col  = QColor(P["red"])
-            bg_col      = QColor(80, 0, 0, pulse_a)
+            banner_text = "Drowsiness detected"
+            banner_col = QColor("#ffffff")
+            bg_col = QColor(P["red"])
         else:
             banner_text = None
-            bg_col      = None
+            banner_col = None
+            bg_col = None
 
         if banner_text:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(bg_col))
-            p.drawRect(0, h - 34, w, 34)
-            p.setFont(QFont("DejaVu Sans Mono", 11, QFont.Bold))
+            p.fillRect(0, h - 38, w, 38, bg_col)
+            p.setFont(QFont("DejaVu Sans", 12, QFont.Bold))
             p.setPen(banner_col)
-            p.drawText(QRect(0, h - 34, w, 34), Qt.AlignCenter, banner_text)
-
+            p.drawText(QRect(0, h - 38, w, 38), Qt.AlignCenter, banner_text)
         p.end()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN WINDOW
-# ═══════════════════════════════════════════════════════════════════════════════
 
 GLOBAL_QSS = f"""
 QMainWindow, QWidget {{
     background: {P['bg']};
     color: {P['white']};
-    font-family: 'DejaVu Sans Mono', 'Courier New', monospace;
+    font-family: 'DejaVu Sans', Arial, sans-serif;
+    font-size: 11px;
 }}
-QPushButton {{
-    background: {P['bg2']};
-    color: {P['green']};
-    border: 1px solid {P['green_dim']};
-    border-radius: 3px;
-    padding: 0px 14px;
-    font-family: 'DejaVu Sans Mono', monospace;
+QFrame#panel {{
+    background: {P['surface']};
+    border: 1px solid {P['border']};
+    border-radius: 6px;
+}}
+QLabel#sectionHeader {{
+    color: {P['dim']};
     font-size: 10px;
     font-weight: bold;
-    min-height: 40px;
-    letter-spacing: 1px;
+    padding-bottom: 2px;
+}}
+QLabel#driverStatus {{
+    font-size: 22px;
+    font-weight: bold;
+}}
+QLabel#probLabel {{
+    color: {P['white']};
+    font-size: 16px;
+    font-weight: bold;
+}}
+QLabel#mutedLabel, QLabel#metricName, QLabel#statusItem {{
+    color: {P['dim']};
+}}
+QLabel#metricValue, QLabel#poseValue {{
+    color: {P['white']};
+    font-weight: bold;
+}}
+QPushButton {{
+    background: {P['bg3']};
+    color: {P['white']};
+    border: 1px solid {P['border_hi']};
+    border-radius: 5px;
+    padding: 0px 14px;
+    min-height: 38px;
+    font-weight: bold;
 }}
 QPushButton:pressed {{
-    background: {P['bg3']};
-    border-color: {P['green']};
-    color: {P['green']};
+    background: {P['border']};
 }}
 QPushButton#danger {{
-    color: {P['red']};
-    border-color: {P['red_dim']};
-}}
-QPushButton#danger:pressed {{
-    background: {P['bg3']};
+    background: {P['red_dim']};
     border-color: {P['red']};
 }}
 QPushButton#pause_active {{
-    color: {P['amber']};
-    border-color: {P['amber_dim']};
+    background: {P['amber_dim']};
+    border-color: {P['amber']};
 }}
-QLabel {{
-    background: transparent;
+QListWidget#eventList {{
+    background: {P['bg2']};
+    border: 1px solid {P['border']};
+    border-radius: 4px;
+    padding: 4px;
 }}
 """
 
@@ -1020,14 +808,14 @@ QLabel {{
 class MainWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
-        self.args          = args
+        self.args = args
         self._session_start = time.time()
-        self._alert_count  = 0
-        self._was_drowsy   = False
-        self._paused       = False
+        self._alert_count = 0
+        self._was_drowsy = False
+        self._paused = False
 
         self.setStyleSheet(GLOBAL_QSS)
-        self.setWindowTitle("DrowsGuard")
+        self.setWindowTitle("DrowsGuard Dashcam")
         self._build_ui()
         self._start_worker()
 
@@ -1035,170 +823,124 @@ class MainWindow(QMainWindow):
         self._clock_timer.timeout.connect(self._tick_clock)
         self._clock_timer.start(1000)
 
-    # ── UI Construction ───────────────────────────────────────────────────────
-
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(8)
         root.addWidget(self._build_header())
 
         body = QHBoxLayout()
-        body.setContentsMargins(6, 5, 6, 5)
-        body.setSpacing(6)
-
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
         self.cam_widget = CameraWidget()
-        body.addWidget(self.cam_widget, 3)
-        body.addLayout(self._build_right_panel(), 2)
-
+        body.addWidget(self.cam_widget, 1)
+        body.addWidget(self._build_right_panel(), 0)
         root.addLayout(body, 1)
         root.addWidget(self._build_footer())
 
     def _build_header(self):
-        bar = QWidget()
-        bar.setFixedHeight(46)
-        bar.setStyleSheet(f"""
-            background: {P['bg2']};
-            border-bottom: 1px solid {P['border']};
-        """)
+        bar = CornerFrame()
+        bar.setFixedHeight(48)
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(16)
 
-        # Logo
-        logo = QLabel("◈  DROWSGUARD  v2")
-        logo.setStyleSheet(f"""
-            color: {P['green']};
-            font-size: 13px;
-            font-weight: bold;
-            letter-spacing: 3px;
-        """)
-        lay.addWidget(logo)
-        lay.addStretch()
+        title = QLabel("DrowsGuard Dashcam")
+        title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        lay.addWidget(title)
 
-        # Status chip
-        self.status_chip = QLabel("● INITIALIZING")
-        self.status_chip.setStyleSheet(
-            f"color: {P['dim']}; font-size: 11px; font-weight: bold;"
-        )
+        self.status_chip = QLabel("Initializing")
+        self.status_chip.setStyleSheet(f"color: {P['dim']}; font-weight: bold;")
         lay.addWidget(self.status_chip)
         lay.addStretch()
 
-        # Alert badge
-        self.alert_badge = QLabel("0 ALERTS")
-        self.alert_badge.setStyleSheet(
-            f"color: {P['dim']}; font-size: 10px;"
-        )
+        self.alert_badge = QLabel("0 alerts")
+        self.alert_badge.setObjectName("mutedLabel")
         lay.addWidget(self.alert_badge)
 
-        # Separator
-        sep = QLabel("  │  ")
-        sep.setStyleSheet(f"color: {P['dimmer']};")
-        lay.addWidget(sep)
-
-        # Session clock
         self.clock_lbl = QLabel("00:00:00")
-        self.clock_lbl.setStyleSheet(
-            f"color: {P['dim']}; font-size: 10px; font-weight: bold;"
-        )
+        self.clock_lbl.setObjectName("mutedLabel")
         lay.addWidget(self.clock_lbl)
-
         return bar
 
+    def _panel_with_layout(self):
+        frame = CornerFrame()
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+        return frame, lay
+
     def _build_right_panel(self):
-        lay = QVBoxLayout()
-        lay.setSpacing(5)
+        panel = QWidget()
+        panel.setFixedWidth(330)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
 
-        # ── Drowsiness gauge ──────────────────────────────────────────────────
-        g_frame = CornerFrame()
-        gf_lay  = QVBoxLayout(g_frame)
-        gf_lay.setContentsMargins(8, 5, 8, 6)
-        gf_lay.setSpacing(2)
-        gf_lay.addWidget(SectionHeader("DROWSINESS INDEX"))
+        frame, flay = self._panel_with_layout()
+        flay.addWidget(SectionHeader("Driver status"))
         self.main_gauge = DrowsinessGauge()
-        gf_lay.addWidget(self.main_gauge, 0, Qt.AlignCenter)
-        lay.addWidget(g_frame)
+        flay.addWidget(self.main_gauge)
+        lay.addWidget(frame)
 
-        # ── Ocular metrics ────────────────────────────────────────────────────
-        e_frame = CornerFrame()
-        ef_lay  = QVBoxLayout(e_frame)
-        ef_lay.setContentsMargins(8, 5, 8, 5)
-        ef_lay.setSpacing(2)
-        ef_lay.addWidget(SectionHeader("OCULAR METRICS"))
+        frame, flay = self._panel_with_layout()
+        flay.addWidget(SectionHeader("Eye and mouth"))
+        self.bar_ear_l = GaugeBar("EAR left", 0.0, 0.5, danger_lo=0.18)
+        self.bar_ear_r = GaugeBar("EAR right", 0.0, 0.5, danger_lo=0.18)
+        self.bar_mar = GaugeBar("MAR", 0.0, 0.8, danger_hi=0.5)
+        self.bar_perclos = GaugeBar("PERCLOS", 0.0, 1.0, danger_hi=0.35)
+        for bar in (self.bar_ear_l, self.bar_ear_r, self.bar_mar, self.bar_perclos):
+            flay.addWidget(bar)
+        lay.addWidget(frame)
 
-        self.bar_ear_l   = GaugeBar("EAR  L",   0.0, 0.5, danger_lo=0.18)
-        self.bar_ear_r   = GaugeBar("EAR  R",   0.0, 0.5, danger_lo=0.18)
-        self.bar_mar     = GaugeBar("MAR",       0.0, 0.8, danger_hi=0.5)
-        self.bar_perclos = GaugeBar("PERCLOS",   0.0, 1.0, danger_hi=0.35)
-        for b in (self.bar_ear_l, self.bar_ear_r, self.bar_mar, self.bar_perclos):
-            ef_lay.addWidget(b)
-        lay.addWidget(e_frame)
-
-        # ── Head pose ─────────────────────────────────────────────────────────
-        p_frame = CornerFrame()
-        pf_lay  = QVBoxLayout(p_frame)
-        pf_lay.setContentsMargins(8, 5, 8, 5)
-        pf_lay.setSpacing(2)
-        pf_lay.addWidget(SectionHeader("HEAD POSE"))
+        frame, flay = self._panel_with_layout()
+        flay.addWidget(SectionHeader("Head pose"))
         self.pose_widget = HeadPoseWidget()
-        pf_lay.addWidget(self.pose_widget)
-        lay.addWidget(p_frame)
+        flay.addWidget(self.pose_widget)
+        lay.addWidget(frame)
 
-        # ── Face / FPS strip ──────────────────────────────────────────────────
+        frame, flay = self._panel_with_layout()
+        flay.addWidget(SectionHeader("Camera"))
         self.face_strip = FaceStatusWidget()
-        self.face_strip.setStyleSheet(
-            f"border: 1px solid {P['border']}; border-radius: 3px;"
-        )
-        lay.addWidget(self.face_strip)
+        flay.addWidget(self.face_strip)
+        lay.addWidget(frame)
 
-        # ── Alert log ─────────────────────────────────────────────────────────
+        frame, flay = self._panel_with_layout()
         self.alert_log = AlertLogWidget()
-        lay.addWidget(self.alert_log, 1)
-
-        return lay
+        flay.addWidget(self.alert_log)
+        lay.addWidget(frame, 1)
+        return panel
 
     def _build_footer(self):
-        bar = QWidget()
+        bar = CornerFrame()
         bar.setFixedHeight(54)
-        bar.setStyleSheet(
-            f"background: {P['bg2']}; border-top: 1px solid {P['border']};"
-        )
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(10, 7, 10, 7)
-        lay.setSpacing(8)
+        lay.setContentsMargins(12, 7, 12, 7)
+        lay.setSpacing(10)
 
-        self.pause_btn = QPushButton("⏸   PAUSE")
-        self.pause_btn.setFixedWidth(130)
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setFixedWidth(120)
         self.pause_btn.clicked.connect(self._toggle_pause)
         lay.addWidget(self.pause_btn)
 
-        # Threshold display
-        self.thresh_lbl = QLabel("THR: —")
-        self.thresh_lbl.setStyleSheet(
-            f"color: {P['dim']}; font-size: 9px; font-weight: bold;"
-        )
+        self.thresh_lbl = QLabel("Threshold --")
+        self.thresh_lbl.setObjectName("mutedLabel")
         lay.addWidget(self.thresh_lbl)
         lay.addStretch()
 
-        # Model name
-        mdl = getattr(self.args, 'model', '')
-        short = Path(mdl).name if mdl else "—"
-        mdl_lbl = QLabel(f"MODEL: {short}")
-        mdl_lbl.setStyleSheet(f"color: {P['dimmer']}; font-size: 8px;")
-        lay.addWidget(mdl_lbl)
-        lay.addStretch()
+        model_name = Path(getattr(self.args, "model", "")).name or "--"
+        model_lbl = QLabel(f"Model: {model_name}")
+        model_lbl.setObjectName("mutedLabel")
+        lay.addWidget(model_lbl)
 
-        quit_btn = QPushButton("✕   QUIT")
+        quit_btn = QPushButton("Quit")
         quit_btn.setObjectName("danger")
-        quit_btn.setFixedWidth(110)
+        quit_btn.setFixedWidth(100)
         quit_btn.clicked.connect(self.close)
         lay.addWidget(quit_btn)
-
         return bar
-
-    # ── Worker lifecycle ──────────────────────────────────────────────────────
 
     def _start_worker(self):
         source = getattr(self.args, 'source', '0')
@@ -1206,17 +948,11 @@ class MainWindow(QMainWindow):
         camera_height = getattr(self.args, 'camera_height', 480)
         camera_fps = getattr(self.args, 'camera_fps', 30)
         if INFERENCE_AVAILABLE:
-            model  = getattr(self.args, 'model', str(DEFAULT_MODEL))
-            clip   = getattr(self.args, 'alert_clip', None)
+            model = getattr(self.args, 'model', str(DEFAULT_MODEL))
+            clip = getattr(self.args, 'alert_clip', None)
             stride = getattr(self.args, 'predict_stride', None)
             self.worker = InferenceWorker(
-                source,
-                model,
-                clip,
-                stride,
-                camera_width,
-                camera_height,
-                camera_fps,
+                source, model, clip, stride, camera_width, camera_height, camera_fps
             )
         else:
             self.worker = DemoWorker(source, camera_width, camera_height, camera_fps)
@@ -1226,91 +962,71 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self.alert_log.add_event("System started", 0)
 
-    # ── Slots ─────────────────────────────────────────────────────────────────
-
     def _on_frame(self, frame, metrics):
-        # Camera view
         self.cam_widget.set_frame(frame)
         self.cam_widget.set_status(metrics["label"], metrics["warmup"])
-
-        # Drowsiness gauge
         self.main_gauge.set_data(metrics["prob"], metrics["label"], metrics["threshold"])
-
-        # Bars
         self.bar_ear_l.set_value(metrics["ear_l"])
         self.bar_ear_r.set_value(metrics["ear_r"])
         self.bar_mar.set_value(metrics["mar"])
         self.bar_perclos.set_value(metrics["perclos"])
-
-        # Head pose
         self.pose_widget.set_pose(metrics["pitch"], metrics["yaw"], metrics["roll"])
+        self.face_strip.update_data(metrics["fps"], metrics["frame_count"], metrics["face_detected"])
+        self.thresh_lbl.setText(f"Threshold {metrics['threshold']:.2f}")
 
-        # Face strip
-        self.face_strip.update_data(metrics["fps"], metrics["frame_count"],
-                                    metrics["face_detected"])
-
-        # Threshold label
-        self.thresh_lbl.setText(f"THR: {metrics['threshold']:.2f}")
-
-        # Header status
         if metrics["warmup"]:
-            self._set_chip("● WARMING UP", P["dim"])
+            self._set_chip("Warming up", P["dimmer"])
         elif metrics["label"] == 1:
-            self._set_chip("▲  DROWSY", P["red"])
-        elif metrics["label"] == 0:
-            self._set_chip("●  ALERT", P["green"])
+            self._set_chip("Drowsiness detected", P["red"])
+        else:
+            self._set_chip("Driver alert", P["green"])
 
-        # Transitions
         if metrics["label"] == 1 and not self._was_drowsy:
             self._was_drowsy = True
             self._alert_count += 1
-            self.alert_log.add_event(
-                f"DROWSINESS DETECTED  (p={metrics['prob']:.2f})", 2
-            )
+            prob = metrics["prob"] if metrics["prob"] is not None else 0.0
+            self.alert_log.add_event(f"Drowsiness detected (p={prob:.2f})", 2)
             self._update_alert_badge()
         elif metrics["label"] == 0 and self._was_drowsy:
             self._was_drowsy = False
-            self.alert_log.add_event("Driver alert — cleared", 0)
+            self.alert_log.add_event("Driver alert cleared", 0)
 
     def _on_error(self, msg):
-        self._set_chip("● ERROR", P["red"])
-        self.alert_log.add_event(f"ERR: {msg[:40]}", 2)
+        self._set_chip("Error", P["red"])
+        self.alert_log.add_event(f"Error: {msg[:60]}", 2)
         self.cam_widget.set_status(None, False)
 
     def _set_chip(self, text, color):
         self.status_chip.setText(text)
-        self.status_chip.setStyleSheet(
-            f"color: {color}; font-size: 11px; font-weight: bold;"
-        )
+        self.status_chip.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     def _update_alert_badge(self):
-        n    = self._alert_count
-        s    = f"{n} ALERT{'S' if n != 1 else ''}"
-        col  = P["red"] if n > 0 else P["dim"]
-        self.alert_badge.setText(s)
-        self.alert_badge.setStyleSheet(f"color: {col}; font-size: 10px; font-weight: bold;")
+        suffix = "s" if self._alert_count != 1 else ""
+        self.alert_badge.setText(f"{self._alert_count} alert{suffix}")
+        color = P["red"] if self._alert_count else P["dim"]
+        self.alert_badge.setStyleSheet(f"color: {color};")
 
     def _toggle_pause(self):
         self._paused = not self._paused
         if self._paused:
             self.worker.pause()
-            self.pause_btn.setText("▶   RESUME")
+            self.pause_btn.setText("Resume")
             self.pause_btn.setObjectName("pause_active")
             self.alert_log.add_event("Session paused", 1)
         else:
             self.worker.resume()
-            self.pause_btn.setText("⏸   PAUSE")
+            self.pause_btn.setText("Pause")
             self.pause_btn.setObjectName("")
             self.alert_log.add_event("Session resumed", 0)
-        self.pause_btn.setStyleSheet("")   # force QSS re-eval
+        self.pause_btn.setStyleSheet("")
         self.setStyleSheet(GLOBAL_QSS)
 
     def _tick_clock(self):
-        e = int(time.time() - self._session_start)
-        self.clock_lbl.setText(f"{e//3600:02d}:{(e%3600)//60:02d}:{e%60:02d}")
+        elapsed = int(time.time() - self._session_start)
+        self.clock_lbl.setText(f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
 
     def closeEvent(self, event):
-        if hasattr(self, 'worker'):
+        if hasattr(self, "worker"):
             self.worker.stop()
         event.accept()
 
