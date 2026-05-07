@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-DrowsGuard — Advanced Dashcam HUD
-===================================
-Full-screen touchscreen UI for the drowsiness detection system.
-Designed for Raspberry Pi 5 (Bookworm) + capacitive display (1024×600).
+DrowsGuard Dashcam UI
+=====================
+Camera-first UI for the drowsiness detection system.
+Designed for Raspberry Pi 5 (Bookworm) + capacitive display.
 
 Install
 -------
@@ -55,9 +55,7 @@ try:
         QImage, QPixmap, QPainter, QColor, QFont
     )
     from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-        QVBoxLayout, QHBoxLayout, QGridLayout, QFrame,
-        QSizePolicy, QProgressBar, QListWidget, QListWidgetItem
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QSizePolicy
     )
 except ModuleNotFoundError as exc:
     raise SystemExit(
@@ -499,197 +497,24 @@ class InferenceWorker(QThread):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MODEST DASHCAM UI
+#  DASHCAM UI
 # ═══════════════════════════════════════════════════════════════════════════════
-
-class SectionHeader(QLabel):
-    def __init__(self, text, parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("sectionHeader")
-
-
-class CornerFrame(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("panel")
-        self.setFrameShape(QFrame.StyledPanel)
-
-
-class DrowsinessGauge(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(145)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-
-        self.status_lbl = QLabel("Initializing")
-        self.status_lbl.setObjectName("driverStatus")
-        self.status_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.status_lbl)
-
-        self.prob_lbl = QLabel("Risk 0%")
-        self.prob_lbl.setObjectName("probLabel")
-        self.prob_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.prob_lbl)
-
-        self.prob_bar = QProgressBar()
-        self.prob_bar.setRange(0, 100)
-        self.prob_bar.setTextVisible(False)
-        self.prob_bar.setFixedHeight(14)
-        lay.addWidget(self.prob_bar)
-
-        self.threshold_lbl = QLabel("Threshold --")
-        self.threshold_lbl.setObjectName("mutedLabel")
-        self.threshold_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self.threshold_lbl)
-
-    def set_data(self, prob, label, thresh):
-        risk = max(0.0, min(1.0, prob if prob is not None else 0.0))
-        if label is None:
-            status, color = "Warming up", P["dimmer"]
-        elif label == 1:
-            status, color = "Drowsiness detected", P["red"]
-        else:
-            status, color = "Driver alert", P["green"]
-
-        self.status_lbl.setText(status)
-        self.status_lbl.setStyleSheet(f"color: {color};")
-        self.prob_lbl.setText(f"Risk {risk * 100:.0f}%")
-        self.threshold_lbl.setText(f"Threshold {thresh:.2f}")
-        self.prob_bar.setValue(int(round(risk * 100)))
-        self.prob_bar.setStyleSheet(
-            "QProgressBar { background: %s; border: 1px solid %s; border-radius: 4px; }"
-            "QProgressBar::chunk { background: %s; border-radius: 4px; }"
-            % (P["bg3"], P["border"], color)
-        )
-
-
-class GaugeBar(QWidget):
-    def __init__(self, label, lo=0.0, hi=1.0, danger_lo=None, danger_hi=None, parent=None):
-        super().__init__(parent)
-        self.lo = lo
-        self.hi = hi
-        self.danger_lo = danger_lo
-        self.danger_hi = danger_hi
-        self.setFixedHeight(30)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-
-        self.name_lbl = QLabel(label)
-        self.name_lbl.setObjectName("metricName")
-        self.name_lbl.setFixedWidth(76)
-        lay.addWidget(self.name_lbl)
-
-        self.bar = QProgressBar()
-        self.bar.setRange(0, 1000)
-        self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(8)
-        lay.addWidget(self.bar, 1)
-
-        self.value_lbl = QLabel("0.000")
-        self.value_lbl.setObjectName("metricValue")
-        self.value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.value_lbl.setFixedWidth(58)
-        lay.addWidget(self.value_lbl)
-
-    def set_value(self, v):
-        if v is None or not np.isfinite(v):
-            v = 0.0
-        clamped = max(self.lo, min(self.hi, float(v)))
-        ratio = (clamped - self.lo) / max(self.hi - self.lo, 1e-6)
-        alert = (
-            (self.danger_lo is not None and v < self.danger_lo) or
-            (self.danger_hi is not None and v > self.danger_hi)
-        )
-        color = P["red"] if alert else P["cyan"]
-        self.value_lbl.setText(f"{v:.3f}")
-        self.value_lbl.setStyleSheet(f"color: {color};")
-        self.bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
-        self.bar.setStyleSheet(
-            "QProgressBar { background: %s; border: none; border-radius: 4px; }"
-            "QProgressBar::chunk { background: %s; border-radius: 4px; }"
-            % (P["bg3"], color)
-        )
-
-
-class HeadPoseWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lay = QGridLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setHorizontalSpacing(12)
-        lay.setVerticalSpacing(4)
-        self.values = {}
-        for col, name in enumerate(("Pitch", "Yaw", "Roll")):
-            title = QLabel(name)
-            title.setObjectName("metricName")
-            value = QLabel("+0.0 deg")
-            value.setObjectName("poseValue")
-            value.setAlignment(Qt.AlignCenter)
-            lay.addWidget(title, 0, col, Qt.AlignCenter)
-            lay.addWidget(value, 1, col, Qt.AlignCenter)
-            self.values[name.lower()] = value
-
-    def set_pose(self, pitch, yaw, roll):
-        self.values["pitch"].setText(f"{pitch:+.1f} deg")
-        self.values["yaw"].setText(f"{yaw:+.1f} deg")
-        self.values["roll"].setText(f"{roll:+.1f} deg")
-
-
-class AlertLogWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._start_time = time.time()
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        lay.addWidget(SectionHeader("Events"))
-        self.list_widget = QListWidget()
-        self.list_widget.setObjectName("eventList")
-        lay.addWidget(self.list_widget)
-
-    def add_event(self, msg, level=1):
-        elapsed = time.time() - self._start_time
-        ts = f"{int(elapsed)//60:02d}:{int(elapsed)%60:02d}"
-        item = QListWidgetItem(f"{ts}  {msg}")
-        item.setForeground(QColor({0: P["green"], 1: P["amber"], 2: P["red"]}.get(level, P["white"])))
-        self.list_widget.insertItem(0, item)
-        while self.list_widget.count() > 80:
-            self.list_widget.takeItem(self.list_widget.count() - 1)
-
-
-class FaceStatusWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-        self.fps_lbl = QLabel("FPS --")
-        self.frames_lbl = QLabel("Frames 0")
-        self.face_lbl = QLabel("Face no")
-        for label in (self.fps_lbl, self.frames_lbl, self.face_lbl):
-            label.setObjectName("statusItem")
-            lay.addWidget(label)
-        lay.addStretch()
-
-    def update_data(self, fps, frames, face):
-        self.fps_lbl.setText(f"FPS {fps:.1f}")
-        self.frames_lbl.setText(f"Frames {frames:,}")
-        self.face_lbl.setText("Face yes" if face else "Face no")
-        self.face_lbl.setStyleSheet(f"color: {P['green'] if face else P['amber']};")
-
 
 class CameraWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
-        self._label = None
-        self._warmup = True
+        self._metrics = {
+            "prob": None,
+            "label": None,
+            "fps": 0.0,
+            "face_detected": False,
+            "warmup": True,
+            "paused": False,
+            "error": "",
+        }
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(420, 300)
+        self.setMinimumSize(240, 180)
 
     def set_frame(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
@@ -698,9 +523,8 @@ class CameraWidget(QWidget):
         self._pixmap = QPixmap.fromImage(qi)
         self.update()
 
-    def set_status(self, label, warmup):
-        self._label = label
-        self._warmup = warmup
+    def set_metrics(self, metrics):
+        self._metrics = dict(metrics)
         self.update()
 
     def paintEvent(self, event):
@@ -708,99 +532,106 @@ class CameraWidget(QWidget):
         w, h = self.width(), self.height()
         p.fillRect(0, 0, w, h, QColor("#050505"))
 
-        if self._pixmap:
+        if self._pixmap is not None and not self._pixmap.isNull():
             scaled = self._pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             ox = (w - scaled.width()) // 2
             oy = (h - scaled.height()) // 2
             p.drawPixmap(ox, oy, scaled)
 
-        p.fillRect(0, 0, w, 34, QColor(0, 0, 0, 145))
-        p.setFont(QFont("DejaVu Sans", 10, QFont.Bold))
+        compact = w < 720 or h < 430
+        tiny = w < 360 or h < 260
+        margin = 8 if compact else 14
+        top_h = 24 if tiny else (28 if compact else 38)
+        bottom_h = 34 if tiny else (42 if compact else 58)
+        label = self._metrics.get("label")
+        warmup = bool(self._metrics.get("warmup"))
+        paused = bool(self._metrics.get("paused"))
+        error = str(self._metrics.get("error") or "")
+        prob = self._metrics.get("prob")
+        risk = max(0.0, min(1.0, prob if prob is not None else 0.0))
+        face_ok = bool(self._metrics.get("face_detected"))
+        fps = float(self._metrics.get("fps") or 0.0)
+
+        p.fillRect(0, 0, w, top_h, QColor(0, 0, 0, 150))
+        p.setFont(QFont("DejaVu Sans", 8 if tiny else (9 if compact else 11), QFont.Bold))
         p.setPen(QColor("#ffffff"))
-        p.drawText(12, 22, time.strftime("%Y-%m-%d  %H:%M:%S"))
+        timestamp = time.strftime("%H:%M:%S") if tiny else time.strftime("%Y-%m-%d  %H:%M:%S")
+        p.drawText(QRect(margin, 0, w - 82, top_h), Qt.AlignVCenter | Qt.AlignLeft, timestamp)
         p.setPen(QColor(P["red"]))
-        p.drawText(w - 58, 22, "REC")
+        rec_w = 46 if tiny else (54 if compact else 66)
+        p.drawText(QRect(w - rec_w - margin, 0, rec_w, top_h), Qt.AlignVCenter | Qt.AlignRight, "REC")
 
-        if self._warmup:
-            banner_text = "Warming up..."
-            banner_col = QColor(P["white"])
-            bg_col = QColor(0, 0, 0, 150)
-        elif self._label == 1:
-            banner_text = "Drowsiness detected"
-            banner_col = QColor("#ffffff")
-            bg_col = QColor(P["red"])
+        p.fillRect(0, h - bottom_h, w, bottom_h, QColor(0, 0, 0, 165))
+        if warmup:
+            status = "WAIT" if tiny else "Warming up"
+            status_color = QColor(P["dimmer"])
+        elif label == 1:
+            status = "ALERT" if tiny else ("Drowsy" if compact else "Drowsiness detected")
+            status_color = QColor(P["red"])
         else:
-            banner_text = None
-            banner_col = None
-            bg_col = None
+            status = "OK" if tiny else "Driver alert"
+            status_color = QColor(P["green"])
 
-        if banner_text:
-            p.fillRect(0, h - 38, w, 38, bg_col)
-            p.setFont(QFont("DejaVu Sans", 12, QFont.Bold))
-            p.setPen(banner_col)
-            p.drawText(QRect(0, h - 38, w, 38), Qt.AlignCenter, banner_text)
+        p.setFont(QFont("DejaVu Sans", 11 if tiny else (12 if compact else 17), QFont.Bold))
+        p.setPen(status_color)
+        risk_text = f"{risk * 100:.0f}%" if tiny else f"Risk {risk * 100:.0f}%"
+        risk_w = 44 if tiny else (78 if compact else 104)
+        status_rect = QRect(margin, h - bottom_h + 2, w - (2 * margin) - risk_w - 12, bottom_h - 12)
+        p.drawText(status_rect, Qt.AlignVCenter | Qt.AlignLeft, status)
+
+        p.setFont(QFont("DejaVu Sans", 9 if tiny else (10 if compact else 13), QFont.Bold))
+        p.setPen(QColor("#ffffff"))
+        risk_rect = QRect(w - risk_w - margin, h - bottom_h + 2, risk_w, bottom_h - 12)
+        p.drawText(risk_rect, Qt.AlignVCenter | Qt.AlignRight, risk_text)
+
+        bar_x = margin
+        bar_w = max(80, w - (2 * margin) - risk_w - 18)
+        bar_y = h - 8 if tiny else (h - 12 if compact else h - 16)
+        bar_h = 4 if tiny else (5 if compact else 7)
+        p.fillRect(bar_x, bar_y, bar_w, bar_h, QColor(90, 90, 90, 170))
+        p.fillRect(bar_x, bar_y, int(bar_w * risk), bar_h, status_color)
+
+        if not tiny:
+            small = f"FPS {fps:.0f}   Face {'yes' if face_ok else 'no'}"
+            if not compact:
+                frame_count = int(self._metrics.get("frame_count") or 0)
+                small += f"   Frame {frame_count:,}"
+            p.setFont(QFont("DejaVu Sans", 8 if compact else 10))
+            p.setPen(QColor(P["dim"]))
+            p.drawText(margin, h - bottom_h + (12 if compact else 17), small)
+
+        if error:
+            err_h = 34 if compact else 46
+            err_y = top_h + 8
+            p.fillRect(0, err_y, w, err_h, QColor(120, 0, 0, 210))
+            p.setFont(QFont("DejaVu Sans", 10 if compact else 13, QFont.Bold))
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRect(margin, err_y, w - 2 * margin, err_h), Qt.AlignVCenter | Qt.AlignLeft, error)
+
+        if paused:
+            pause_h = 44 if compact else 64
+            pause_y = max(top_h + 6, h // 2 - pause_h // 2)
+            p.fillRect(0, pause_y, w, pause_h, QColor(0, 0, 0, 185))
+            p.setFont(QFont("DejaVu Sans", 16 if compact else 24, QFont.Bold))
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRect(0, pause_y, w, pause_h), Qt.AlignCenter, "PAUSED")
+
+        alert_text = "ALERT" if compact else "DROWSINESS ALERT"
+        if label == 1 and not warmup and not paused:
+            alert_h = 44 if compact else 64
+            alert_y = max(top_h + 6, h // 2 - alert_h // 2)
+            p.fillRect(0, alert_y, w, alert_h, QColor(P["red"]))
+            p.setFont(QFont("DejaVu Sans", 16 if compact else 23, QFont.Bold))
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRect(0, alert_y, w, alert_h), Qt.AlignCenter, alert_text)
         p.end()
 
 
 GLOBAL_QSS = f"""
 QMainWindow, QWidget {{
-    background: {P['bg']};
+    background: #000000;
     color: {P['white']};
     font-family: 'DejaVu Sans', Arial, sans-serif;
-    font-size: 11px;
-}}
-QFrame#panel {{
-    background: {P['surface']};
-    border: 1px solid {P['border']};
-    border-radius: 6px;
-}}
-QLabel#sectionHeader {{
-    color: {P['dim']};
-    font-size: 10px;
-    font-weight: bold;
-    padding-bottom: 2px;
-}}
-QLabel#driverStatus {{
-    font-size: 22px;
-    font-weight: bold;
-}}
-QLabel#probLabel {{
-    color: {P['white']};
-    font-size: 16px;
-    font-weight: bold;
-}}
-QLabel#mutedLabel, QLabel#metricName, QLabel#statusItem {{
-    color: {P['dim']};
-}}
-QLabel#metricValue, QLabel#poseValue {{
-    color: {P['white']};
-    font-weight: bold;
-}}
-QPushButton {{
-    background: {P['bg3']};
-    color: {P['white']};
-    border: 1px solid {P['border_hi']};
-    border-radius: 5px;
-    padding: 0px 14px;
-    min-height: 38px;
-    font-weight: bold;
-}}
-QPushButton:pressed {{
-    background: {P['border']};
-}}
-QPushButton#danger {{
-    background: {P['red_dim']};
-    border-color: {P['red']};
-}}
-QPushButton#pause_active {{
-    background: {P['amber_dim']};
-    border-color: {P['amber']};
-}}
-QListWidget#eventList {{
-    background: {P['bg2']};
-    border: 1px solid {P['border']};
-    border-radius: 4px;
-    padding: 4px;
 }}
 """
 
@@ -809,10 +640,8 @@ class MainWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self._session_start = time.time()
-        self._alert_count = 0
-        self._was_drowsy = False
         self._paused = False
+        self._last_error = ""
 
         self.setStyleSheet(GLOBAL_QSS)
         self.setWindowTitle("DrowsGuard Dashcam")
@@ -827,120 +656,10 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(8)
-        root.addWidget(self._build_header())
-
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
         self.cam_widget = CameraWidget()
-        body.addWidget(self.cam_widget, 1)
-        body.addWidget(self._build_right_panel(), 0)
-        root.addLayout(body, 1)
-        root.addWidget(self._build_footer())
-
-    def _build_header(self):
-        bar = CornerFrame()
-        bar.setFixedHeight(48)
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(14, 0, 14, 0)
-        lay.setSpacing(16)
-
-        title = QLabel("DrowsGuard Dashcam")
-        title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        lay.addWidget(title)
-
-        self.status_chip = QLabel("Initializing")
-        self.status_chip.setStyleSheet(f"color: {P['dim']}; font-weight: bold;")
-        lay.addWidget(self.status_chip)
-        lay.addStretch()
-
-        self.alert_badge = QLabel("0 alerts")
-        self.alert_badge.setObjectName("mutedLabel")
-        lay.addWidget(self.alert_badge)
-
-        self.clock_lbl = QLabel("00:00:00")
-        self.clock_lbl.setObjectName("mutedLabel")
-        lay.addWidget(self.clock_lbl)
-        return bar
-
-    def _panel_with_layout(self):
-        frame = CornerFrame()
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(8)
-        return frame, lay
-
-    def _build_right_panel(self):
-        panel = QWidget()
-        panel.setFixedWidth(330)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-
-        frame, flay = self._panel_with_layout()
-        flay.addWidget(SectionHeader("Driver status"))
-        self.main_gauge = DrowsinessGauge()
-        flay.addWidget(self.main_gauge)
-        lay.addWidget(frame)
-
-        frame, flay = self._panel_with_layout()
-        flay.addWidget(SectionHeader("Eye and mouth"))
-        self.bar_ear_l = GaugeBar("EAR left", 0.0, 0.5, danger_lo=0.18)
-        self.bar_ear_r = GaugeBar("EAR right", 0.0, 0.5, danger_lo=0.18)
-        self.bar_mar = GaugeBar("MAR", 0.0, 0.8, danger_hi=0.5)
-        self.bar_perclos = GaugeBar("PERCLOS", 0.0, 1.0, danger_hi=0.35)
-        for bar in (self.bar_ear_l, self.bar_ear_r, self.bar_mar, self.bar_perclos):
-            flay.addWidget(bar)
-        lay.addWidget(frame)
-
-        frame, flay = self._panel_with_layout()
-        flay.addWidget(SectionHeader("Head pose"))
-        self.pose_widget = HeadPoseWidget()
-        flay.addWidget(self.pose_widget)
-        lay.addWidget(frame)
-
-        frame, flay = self._panel_with_layout()
-        flay.addWidget(SectionHeader("Camera"))
-        self.face_strip = FaceStatusWidget()
-        flay.addWidget(self.face_strip)
-        lay.addWidget(frame)
-
-        frame, flay = self._panel_with_layout()
-        self.alert_log = AlertLogWidget()
-        flay.addWidget(self.alert_log)
-        lay.addWidget(frame, 1)
-        return panel
-
-    def _build_footer(self):
-        bar = CornerFrame()
-        bar.setFixedHeight(54)
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(12, 7, 12, 7)
-        lay.setSpacing(10)
-
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.setFixedWidth(120)
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        lay.addWidget(self.pause_btn)
-
-        self.thresh_lbl = QLabel("Threshold --")
-        self.thresh_lbl.setObjectName("mutedLabel")
-        lay.addWidget(self.thresh_lbl)
-        lay.addStretch()
-
-        model_name = Path(getattr(self.args, "model", "")).name or "--"
-        model_lbl = QLabel(f"Model: {model_name}")
-        model_lbl.setObjectName("mutedLabel")
-        lay.addWidget(model_lbl)
-
-        quit_btn = QPushButton("Quit")
-        quit_btn.setObjectName("danger")
-        quit_btn.setFixedWidth(100)
-        quit_btn.clicked.connect(self.close)
-        lay.addWidget(quit_btn)
-        return bar
+        root.addWidget(self.cam_widget)
 
     def _start_worker(self):
         source = getattr(self.args, 'source', '0')
@@ -960,70 +679,48 @@ class MainWindow(QMainWindow):
         self.worker.signals.frame_ready.connect(self._on_frame)
         self.worker.signals.error.connect(self._on_error)
         self.worker.start()
-        self.alert_log.add_event("System started", 0)
 
     def _on_frame(self, frame, metrics):
         self.cam_widget.set_frame(frame)
-        self.cam_widget.set_status(metrics["label"], metrics["warmup"])
-        self.main_gauge.set_data(metrics["prob"], metrics["label"], metrics["threshold"])
-        self.bar_ear_l.set_value(metrics["ear_l"])
-        self.bar_ear_r.set_value(metrics["ear_r"])
-        self.bar_mar.set_value(metrics["mar"])
-        self.bar_perclos.set_value(metrics["perclos"])
-        self.pose_widget.set_pose(metrics["pitch"], metrics["yaw"], metrics["roll"])
-        self.face_strip.update_data(metrics["fps"], metrics["frame_count"], metrics["face_detected"])
-        self.thresh_lbl.setText(f"Threshold {metrics['threshold']:.2f}")
-
-        if metrics["warmup"]:
-            self._set_chip("Warming up", P["dimmer"])
-        elif metrics["label"] == 1:
-            self._set_chip("Drowsiness detected", P["red"])
-        else:
-            self._set_chip("Driver alert", P["green"])
-
-        if metrics["label"] == 1 and not self._was_drowsy:
-            self._was_drowsy = True
-            self._alert_count += 1
-            prob = metrics["prob"] if metrics["prob"] is not None else 0.0
-            self.alert_log.add_event(f"Drowsiness detected (p={prob:.2f})", 2)
-            self._update_alert_badge()
-        elif metrics["label"] == 0 and self._was_drowsy:
-            self._was_drowsy = False
-            self.alert_log.add_event("Driver alert cleared", 0)
+        metrics = dict(metrics)
+        metrics["paused"] = self._paused
+        if self._last_error:
+            metrics["error"] = self._last_error
+        self.cam_widget.set_metrics(metrics)
 
     def _on_error(self, msg):
-        self._set_chip("Error", P["red"])
-        self.alert_log.add_event(f"Error: {msg[:60]}", 2)
-        self.cam_widget.set_status(None, False)
-
-    def _set_chip(self, text, color):
-        self.status_chip.setText(text)
-        self.status_chip.setStyleSheet(f"color: {color}; font-weight: bold;")
-
-    def _update_alert_badge(self):
-        suffix = "s" if self._alert_count != 1 else ""
-        self.alert_badge.setText(f"{self._alert_count} alert{suffix}")
-        color = P["red"] if self._alert_count else P["dim"]
-        self.alert_badge.setStyleSheet(f"color: {color};")
+        self._last_error = msg[:80]
+        self.cam_widget.set_metrics({
+            "prob": None,
+            "label": None,
+            "fps": 0.0,
+            "face_detected": False,
+            "warmup": False,
+            "paused": self._paused,
+            "error": self._last_error,
+        })
 
     def _toggle_pause(self):
         self._paused = not self._paused
         if self._paused:
             self.worker.pause()
-            self.pause_btn.setText("Resume")
-            self.pause_btn.setObjectName("pause_active")
-            self.alert_log.add_event("Session paused", 1)
         else:
             self.worker.resume()
-            self.pause_btn.setText("Pause")
-            self.pause_btn.setObjectName("")
-            self.alert_log.add_event("Session resumed", 0)
-        self.pause_btn.setStyleSheet("")
-        self.setStyleSheet(GLOBAL_QSS)
+        metrics = dict(self.cam_widget._metrics)
+        metrics["paused"] = self._paused
+        self.cam_widget.set_metrics(metrics)
 
     def _tick_clock(self):
-        elapsed = int(time.time() - self._session_start)
-        self.clock_lbl.setText(f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
+        self.cam_widget.update()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Q, Qt.Key_Escape):
+            self.close()
+        elif key in (Qt.Key_Space, Qt.Key_P):
+            self._toggle_pause()
+        else:
+            super().keyPressEvent(event)
 
     def closeEvent(self, event):
         if hasattr(self, "worker"):
