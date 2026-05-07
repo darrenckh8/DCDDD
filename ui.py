@@ -21,6 +21,7 @@ import argparse
 import collections
 import json
 import math
+import os
 import sys
 import time
 import warnings
@@ -35,6 +36,10 @@ except ModuleNotFoundError as exc:
         "Activate your project virtualenv and install required packages."
     ) from exc
 
+for _qt_env_name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
+    if "cv2" in os.environ.get(_qt_env_name, "").lower():
+        os.environ.pop(_qt_env_name, None)
+
 try:
     from picamera2 import Picamera2
     PICAMERA2_AVAILABLE = True
@@ -45,7 +50,7 @@ except ModuleNotFoundError:
 try:
     from PyQt5.QtCore import (
         Qt, QThread, QTimer, pyqtSignal, QObject, QRect, QPointF,
-        QRectF, QSizeF
+        QRectF, QSizeF, QLibraryInfo
     )
     from PyQt5.QtGui import (
         QImage, QPixmap, QPainter, QColor, QFont, QPen, QBrush,
@@ -119,6 +124,27 @@ P = {
 
 def qc(key):
     return QColor(P[key])
+
+
+def configure_qt_environment(qt_platform=None):
+    """Keep OpenCV's bundled Qt plugins from hijacking PyQt startup."""
+    for name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
+        if "cv2" in os.environ.get(name, "").lower():
+            os.environ.pop(name, None)
+
+    plugin_path = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+    if plugin_path:
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+
+    if qt_platform:
+        os.environ["QT_QPA_PLATFORM"] = qt_platform
+    elif "QT_QPA_PLATFORM" not in os.environ:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            os.environ["QT_QPA_PLATFORM"] = "wayland"
+        elif os.environ.get("DISPLAY"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
+        else:
+            os.environ["QT_QPA_PLATFORM"] = "linuxfb"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1311,6 +1337,9 @@ def parse_args():
                     help="Picamera2 capture height for numeric camera sources")
     ap.add_argument("--camera-fps", type=int, default=30,
                     help="Requested Picamera2 frame rate for numeric camera sources")
+    ap.add_argument("--qt-platform", default=None,
+                    choices=["xcb", "wayland", "eglfs", "linuxfb", "offscreen", "minimal"],
+                    help="Override Qt platform plugin if auto-detection is wrong")
     ap.add_argument("--no-fullscreen", action="store_true",
                     help="Run in a window instead of full screen")
     return ap.parse_args()
@@ -1319,10 +1348,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # Wayland / EGLFS on Pi — force xcb or linuxfb
-    import os
-    if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
-        os.environ.setdefault("QT_QPA_PLATFORM", "linuxfb")
+    configure_qt_environment(args.qt_platform)
 
     app = QApplication(sys.argv)
     app.setApplicationName("DrowsGuard")
