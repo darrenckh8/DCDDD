@@ -178,10 +178,11 @@ class Picamera2Capture:
         frame = self._camera.capture_array()
         if frame is None:
             return False, None
+        # Picamera2's RGB888 stream arrives in the channel order expected by
+        # OpenCV/MediaPipe here. Swapping it again makes the UI look blue.
         if frame.ndim == 3 and frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-        else:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame = frame[:, :, :3]
+        frame = np.ascontiguousarray(frame)
         return True, frame
 
     def reset(self):
