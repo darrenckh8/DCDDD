@@ -8,7 +8,7 @@ Designed for Raspberry Pi 5 (Bookworm) + capacitive display.
 Install
 -------
   sudo apt install python3-pyqt5 python3-picamera2
-  sudo apt install speech-dispatcher espeak-ng   # optional voice prompts
+  sudo apt install flite espeak-ng   # optional voice prompts
   # or: pip install PyQt5 --break-system-packages
 
 Usage
@@ -127,16 +127,31 @@ DEFAULT_CALIBRATION_FRAMES = 90
 class AudioNotifier:
     """Small non-blocking voice/beep helper for dashcam prompts."""
 
-    def __init__(self, enabled=True, alert_interval=8.0):
+    def __init__(
+        self,
+        enabled=True,
+        alert_interval=8.0,
+        engine="espeak-ng",
+        voice=None,
+        rate=132,
+    ):
         self.enabled = bool(enabled)
         self.alert_interval = max(1.0, float(alert_interval))
+        self.engine = engine
+        self.voice = voice
+        self.rate = max(80, min(260, int(rate)))
         self._last_spoken = {}
         self._busy = False
         self._lock = threading.Lock()
         self._speaker = self._find_speaker()
 
     def _find_speaker(self):
-        for cmd in ("spd-say", "espeak-ng", "espeak", "say"):
+        fallback = ("espeak-ng", "flite", "espeak", "say", "spd-say")
+        if self.engine and self.engine != "auto":
+            candidates = (self.engine,) + tuple(c for c in fallback if c != self.engine)
+        else:
+            candidates = fallback
+        for cmd in candidates:
             path = shutil.which(cmd)
             if path:
                 return path
@@ -168,10 +183,25 @@ class AudioNotifier:
             self._busy = True
         try:
             name = Path(self._speaker).name
-            if name == "spd-say":
-                cmd = [self._speaker, text]
+            if name == "flite":
+                voice = self.voice or "slt"
+                cmd = [self._speaker, "-voice", voice, "-t", text]
             elif name in ("espeak", "espeak-ng"):
-                cmd = [self._speaker, "-s", "155", text]
+                voice = self.voice or "en-us+f4"
+                cmd = [
+                    self._speaker, "-v", voice,
+                    "-s", str(self.rate),
+                    "-p", "42",
+                    "-g", "5",
+                    text,
+                ]
+            elif name == "say":
+                cmd = [self._speaker]
+                if self.voice:
+                    cmd.extend(["-v", self.voice])
+                cmd.extend(["-r", str(self.rate), text])
+            elif name == "spd-say":
+                cmd = [self._speaker, "-r", "-45", text]
             else:
                 cmd = [self._speaker, text]
             subprocess.run(
@@ -221,6 +251,19 @@ def _camera_index(source):
         return int(raw)
     except ValueError:
         return None
+
+
+def rotate_frame(frame, rotation):
+    rotation = int(rotation) % 360
+    if rotation == 0:
+        return frame
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError(f"Unsupported frame rotation: {rotation}")
 
 
 class Picamera2Capture:
@@ -332,12 +375,21 @@ class InferenceSignals(QObject):
 
 class DemoWorker(QThread):
     """Generates synthetic data when live_inference is unavailable."""
-    def __init__(self, source="0", camera_width=640, camera_height=480, camera_fps=30, parent=None):
+    def __init__(
+        self,
+        source="0",
+        camera_width=640,
+        camera_height=480,
+        camera_fps=30,
+        frame_rotation=0,
+        parent=None,
+    ):
         super().__init__(parent)
         self.source = source
         self.camera_width = camera_width
         self.camera_height = camera_height
         self.camera_fps = camera_fps
+        self.frame_rotation = int(frame_rotation) % 360
         self.signals  = InferenceSignals()
         self._running = True
         self._paused  = False
@@ -373,6 +425,7 @@ class DemoWorker(QThread):
                 cv2.putText(frame, "NO CAMERA — DEMO MODE",
                             (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                             (0, 200, 100), 2)
+            frame = rotate_frame(frame, self.frame_rotation)
 
             if not self._calibrated:
                 if self._calibration_requested:
@@ -438,6 +491,7 @@ class InferenceWorker(QThread):
         camera_height=480,
         camera_fps=30,
         calibration_frames=DEFAULT_CALIBRATION_FRAMES,
+        frame_rotation=0,
         parent=None,
     ):
         super().__init__(parent)
@@ -449,6 +503,7 @@ class InferenceWorker(QThread):
         self.camera_height = camera_height
         self.camera_fps = camera_fps
         self.calibration_frames = max(30, int(calibration_frames))
+        self.frame_rotation = int(frame_rotation) % 360
         self.signals     = InferenceSignals()
         self._running    = True
         self._paused     = False
@@ -578,6 +633,7 @@ class InferenceWorker(QThread):
                 else:
                     time.sleep(0.02)
                 continue
+            frame = rotate_frame(frame, self.frame_rotation)
 
             H, W  = frame.shape[:2]
             frame_count += 1
@@ -929,6 +985,9 @@ class MainWindow(QMainWindow):
         self.audio = AudioNotifier(
             enabled=not getattr(args, "mute_audio", False),
             alert_interval=getattr(args, "audio_alert_interval", 8.0),
+            engine=getattr(args, "audio_engine", "espeak-ng"),
+            voice=getattr(args, "audio_voice", None),
+            rate=getattr(args, "audio_rate", 132),
         )
 
         self.setStyleSheet(GLOBAL_QSS)
@@ -953,10 +1012,10 @@ class MainWindow(QMainWindow):
 
     def _play_startup_instruction(self):
         if getattr(self.args, "alert_clip", None):
-            self.audio.say("Calibration loaded. Monitoring will start shortly.", key="startup")
+            self.audio.say("Calibration loaded. Monitoring will begin shortly.", key="startup")
         else:
             self.audio.say(
-                "Face forward with eyes open, then press start to normalize.",
+                "Please face forward, then tap start.",
                 key="cal_wait",
                 min_interval=12.0,
             )
@@ -967,16 +1026,19 @@ class MainWindow(QMainWindow):
         camera_height = getattr(self.args, 'camera_height', 480)
         camera_fps = getattr(self.args, 'camera_fps', 30)
         calibration_frames = getattr(self.args, 'calibration_frames', DEFAULT_CALIBRATION_FRAMES)
+        frame_rotation = getattr(self.args, 'rotation', 180)
         if INFERENCE_AVAILABLE:
             model = getattr(self.args, 'model', str(DEFAULT_MODEL))
             clip = getattr(self.args, 'alert_clip', None)
             stride = getattr(self.args, 'predict_stride', None)
             self.worker = InferenceWorker(
                 source, model, clip, stride, camera_width, camera_height, camera_fps,
-                calibration_frames
+                calibration_frames, frame_rotation
             )
         else:
-            self.worker = DemoWorker(source, camera_width, camera_height, camera_fps)
+            self.worker = DemoWorker(
+                source, camera_width, camera_height, camera_fps, frame_rotation
+            )
 
         self.worker.signals.frame_ready.connect(self._on_frame)
         self.worker.signals.error.connect(self._on_error)
@@ -986,7 +1048,7 @@ class MainWindow(QMainWindow):
         self._last_error = ""
         if hasattr(self.worker, "start_calibration"):
             self.worker.start_calibration()
-        self.audio.say("Hold still. Normalizing driver.", key="normalize_start", min_interval=2.0)
+        self.audio.say("Calibrating. Please hold still.", key="normalize_start", min_interval=2.0)
         metrics = dict(self.cam_widget._metrics)
         metrics.update({
             "prob": None,
@@ -1020,25 +1082,25 @@ class MainWindow(QMainWindow):
             if calibration_state != self._last_audio_calibration_state:
                 if calibration_state == "waiting":
                     self.audio.say(
-                        "Face forward with eyes open, then press start to normalize.",
+                        "Please face forward, then tap start.",
                         key="cal_wait",
                         min_interval=12.0,
                     )
                 elif calibration_state == "calibrating":
                     self.audio.say(
-                        "Hold still. Keep your face in view.",
+                        "Hold still.",
                         key="cal_active",
                         min_interval=5.0,
                     )
                 elif calibration_state == "no_face":
                     self.audio.say(
-                        "Face not detected. Move into view.",
+                        "Driver not visible.",
                         key="cal_no_face",
                         min_interval=4.0,
                     )
             elif calibration_state == "no_face":
                 self.audio.say(
-                    "Face not detected. Move into view.",
+                    "Driver not visible.",
                     key="cal_no_face",
                     min_interval=6.0,
                 )
@@ -1047,13 +1109,13 @@ class MainWindow(QMainWindow):
             return
 
         if calibrated and not self._last_audio_calibrated:
-            self.audio.say("Normalization complete. Monitoring started.", key="cal_done")
+            self.audio.say("Calibration complete. Monitoring active.", key="cal_done")
         self._last_audio_calibrated = True
         self._last_audio_calibration_state = calibration_state
 
         if not face_ok:
             self.audio.say(
-                "Face not detected.",
+                "Driver not visible.",
                 key="no_face",
                 min_interval=7.0,
             )
@@ -1062,12 +1124,12 @@ class MainWindow(QMainWindow):
             return
 
         if self._last_audio_face_ok is False:
-            self.audio.say("Face detected. Monitoring resumed.", key="face_back", min_interval=5.0)
+            self.audio.say("Driver visible. Monitoring resumed.", key="face_back", min_interval=5.0)
         self._last_audio_face_ok = True
 
         if label == 1 and not warmup:
             self.audio.say(
-                "Drowsiness detected. Please stay alert.",
+                "Attention. Drowsiness detected.",
                 key="drowsy_alert",
                 min_interval=self.audio.alert_interval,
                 beep=True,
@@ -1078,7 +1140,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg):
         self._last_error = msg[:80]
-        self.audio.say("System error.", key="system_error", min_interval=10.0, beep=True)
+        self.audio.say("System alert.", key="system_error", min_interval=10.0, beep=True)
         self.cam_widget.set_metrics({
             "prob": None,
             "label": None,
@@ -1144,12 +1206,22 @@ def parse_args():
                     help="Picamera2 capture height for numeric camera sources")
     ap.add_argument("--camera-fps", type=int, default=30,
                     help="Requested Picamera2 frame rate for numeric camera sources")
+    ap.add_argument("--rotation", type=int, default=180,
+                    choices=[0, 90, 180, 270],
+                    help="Rotate camera/video frames before inference and display")
     ap.add_argument("--calibration-frames", type=int, default=DEFAULT_CALIBRATION_FRAMES,
                     help="Detected face frames to collect for startup normalization")
     ap.add_argument("--mute-audio", action="store_true",
                     help="Disable voice prompts and alert beeps")
     ap.add_argument("--audio-alert-interval", type=float, default=8.0,
                     help="Minimum seconds between repeated drowsiness audio alerts")
+    ap.add_argument("--audio-engine", default="espeak-ng",
+                    choices=["auto", "flite", "espeak-ng", "espeak", "say", "spd-say"],
+                    help="Voice prompt engine. Default uses the calmer espeak-ng profile")
+    ap.add_argument("--audio-voice", default=None,
+                    help="Optional engine voice, e.g. flite 'slt' or espeak-ng 'en-us+f4'")
+    ap.add_argument("--audio-rate", type=int, default=132,
+                    help="Voice speaking rate for espeak/say engines")
     ap.add_argument("--qt-platform", default=None,
                     choices=["xcb", "wayland", "eglfs", "linuxfb", "offscreen", "minimal"],
                     help="Override Qt platform plugin if auto-detection is wrong")
