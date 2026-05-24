@@ -8,7 +8,8 @@ Designed for Raspberry Pi 5 (Bookworm) + capacitive display.
 Install
 -------
   sudo apt install python3-pyqt5 python3-picamera2
-  sudo apt install flite espeak-ng   # optional voice prompts
+  pip install piper-tts              # optional neural voice prompts
+  sudo apt install flite espeak-ng   # fallback voice prompts
   # or: pip install PyQt5 --break-system-packages
 
 Usage
@@ -26,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import warnings
@@ -122,6 +124,13 @@ P = {
 }
 
 DEFAULT_CALIBRATION_FRAMES = 90
+PIPER_MODEL_CANDIDATES = (
+    "piper_voice.onnx",
+    "voice.onnx",
+    "en_US-amy-medium.onnx",
+    "en_US-lessac-medium.onnx",
+    "en_US-ryan-medium.onnx",
+)
 
 
 class AudioNotifier:
@@ -131,7 +140,7 @@ class AudioNotifier:
         self,
         enabled=True,
         alert_interval=8.0,
-        engine="espeak-ng",
+        engine="piper",
         voice=None,
         rate=132,
     ):
@@ -143,18 +152,64 @@ class AudioNotifier:
         self._last_spoken = {}
         self._busy = False
         self._lock = threading.Lock()
+        self._piper_model = None
         self._speaker = self._find_speaker()
 
     def _find_speaker(self):
-        fallback = ("espeak-ng", "flite", "espeak", "say", "spd-say")
+        fallback = ("piper", "flite", "espeak-ng", "espeak", "say", "spd-say")
         if self.engine and self.engine != "auto":
             candidates = (self.engine,) + tuple(c for c in fallback if c != self.engine)
         else:
             candidates = fallback
         for cmd in candidates:
             path = shutil.which(cmd)
+            if not path:
+                continue
+            if cmd == "piper":
+                model = self._find_piper_model()
+                if not model or not self._audio_player_cmd("__probe__.wav"):
+                    continue
+                self._piper_model = model
+            return path
+        return None
+
+    def _find_piper_model(self):
+        candidates = []
+        if self.voice:
+            candidates.append(Path(self.voice).expanduser())
+        env_model = os.environ.get("PIPER_MODEL")
+        if env_model:
+            candidates.append(Path(env_model).expanduser())
+        candidates.extend(BASE_DIR / name for name in PIPER_MODEL_CANDIDATES)
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.suffix == ".onnx":
+                return str(candidate)
+
+        for root in (Path("/usr/share/piper-voices"), Path("/usr/local/share/piper-voices")):
+            if not root.exists():
+                continue
+            for name in PIPER_MODEL_CANDIDATES[2:]:
+                matches = list(root.glob(f"**/{name}"))
+                if matches:
+                    return str(matches[0])
+            matches = list(root.glob("**/*.onnx"))
+            if matches:
+                return str(matches[0])
+        return None
+
+    def _audio_player_cmd(self, wav_path):
+        players = (
+            ("aplay", ["-q", wav_path]),
+            ("paplay", [wav_path]),
+            ("pw-play", [wav_path]),
+            ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", wav_path]),
+            ("afplay", [wav_path]),
+        )
+        for name, args in players:
+            path = shutil.which(name)
             if path:
-                return path
+                return [path] + args
         return None
 
     def say(self, text, key=None, min_interval=0.0, beep=False):
@@ -183,6 +238,35 @@ class AudioNotifier:
             self._busy = True
         try:
             name = Path(self._speaker).name
+            if name == "piper":
+                wav_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                        wav_path = fh.name
+                    subprocess.run(
+                        [self._speaker, "--model", self._piper_model, "--output_file", wav_path],
+                        input=f"{text}\n".encode("utf-8"),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                    player = self._audio_player_cmd(wav_path)
+                    if player:
+                        subprocess.run(
+                            player,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=8,
+                            check=False,
+                        )
+                finally:
+                    if wav_path:
+                        try:
+                            os.unlink(wav_path)
+                        except OSError:
+                            pass
+                return
             if name == "flite":
                 voice = self.voice or "slt"
                 cmd = [self._speaker, "-voice", voice, "-t", text]
@@ -985,7 +1069,7 @@ class MainWindow(QMainWindow):
         self.audio = AudioNotifier(
             enabled=not getattr(args, "mute_audio", False),
             alert_interval=getattr(args, "audio_alert_interval", 8.0),
-            engine=getattr(args, "audio_engine", "espeak-ng"),
+            engine=getattr(args, "audio_engine", "piper"),
             voice=getattr(args, "audio_voice", None),
             rate=getattr(args, "audio_rate", 132),
         )
@@ -1215,11 +1299,14 @@ def parse_args():
                     help="Disable voice prompts and alert beeps")
     ap.add_argument("--audio-alert-interval", type=float, default=8.0,
                     help="Minimum seconds between repeated drowsiness audio alerts")
-    ap.add_argument("--audio-engine", default="espeak-ng",
-                    choices=["auto", "flite", "espeak-ng", "espeak", "say", "spd-say"],
-                    help="Voice prompt engine. Default uses the calmer espeak-ng profile")
+    ap.add_argument("--audio-engine", default="piper",
+                    choices=["auto", "piper", "flite", "espeak-ng", "espeak", "say", "spd-say"],
+                    help="Voice prompt engine. Default uses Piper neural TTS")
     ap.add_argument("--audio-voice", default=None,
-                    help="Optional engine voice, e.g. flite 'slt' or espeak-ng 'en-us+f4'")
+                    help=("Optional voice. For Piper, pass a .onnx voice model path; "
+                          "for espeak-ng, use names like 'en-us+f4'."))
+    ap.add_argument("--piper-model", dest="audio_voice", default=None,
+                    help="Alias for --audio-voice when using Piper")
     ap.add_argument("--audio-rate", type=int, default=132,
                     help="Voice speaking rate for espeak/say engines")
     ap.add_argument("--qt-platform", default=None,
