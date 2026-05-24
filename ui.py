@@ -153,6 +153,8 @@ class AudioNotifier:
         self._busy = False
         self._lock = threading.Lock()
         self._piper_model = None
+        self._piper_config = None
+        self._warned = set()
         self._speaker = self._find_speaker()
 
     def _find_speaker(self):
@@ -167,7 +169,18 @@ class AudioNotifier:
                 continue
             if cmd == "piper":
                 model = self._find_piper_model()
-                if not model or not self._audio_player_cmd("__probe__.wav"):
+                if not model:
+                    self._warn_once(
+                        "piper_model",
+                        "Audio: Piper found, but no Piper .onnx voice model with matching config was found.",
+                    )
+                    continue
+                player = self._audio_player_cmd("__probe__.wav")
+                if not player:
+                    self._warn_once(
+                        "piper_player",
+                        "Audio: Piper voice found, but no WAV player found. Install alsa-utils for aplay.",
+                    )
                     continue
                 self._piper_model = model
             return path
@@ -176,14 +189,22 @@ class AudioNotifier:
     def _find_piper_model(self):
         candidates = []
         if self.voice:
-            candidates.append(Path(self.voice).expanduser())
+            candidates.extend(self._piper_model_candidates_from_path(Path(self.voice).expanduser()))
         env_model = os.environ.get("PIPER_MODEL")
         if env_model:
-            candidates.append(Path(env_model).expanduser())
+            candidates.extend(self._piper_model_candidates_from_path(Path(env_model).expanduser()))
         candidates.extend(BASE_DIR / name for name in PIPER_MODEL_CANDIDATES)
+        candidates.extend(sorted(BASE_DIR.glob("*.onnx")))
+        for folder in (BASE_DIR / "voices", BASE_DIR / "piper_voices"):
+            if folder.exists():
+                candidates.extend(sorted(folder.glob("**/*.onnx")))
 
         for candidate in candidates:
-            if candidate.exists() and candidate.suffix == ".onnx":
+            if not candidate.exists() or candidate.suffix != ".onnx":
+                continue
+            config = self._piper_config_for(candidate)
+            if config:
+                self._piper_config = config
                 return str(candidate)
 
         for root in (Path("/usr/share/piper-voices"), Path("/usr/local/share/piper-voices")):
@@ -192,11 +213,38 @@ class AudioNotifier:
             for name in PIPER_MODEL_CANDIDATES[2:]:
                 matches = list(root.glob(f"**/{name}"))
                 if matches:
-                    return str(matches[0])
-            matches = list(root.glob("**/*.onnx"))
-            if matches:
-                return str(matches[0])
+                    config = self._piper_config_for(matches[0])
+                    if config:
+                        self._piper_config = config
+                        return str(matches[0])
+            for match in sorted(root.glob("**/*.onnx")):
+                config = self._piper_config_for(match)
+                if config:
+                    self._piper_config = config
+                    return str(match)
         return None
+
+    def _piper_model_candidates_from_path(self, path):
+        if path.is_dir():
+            return sorted(path.glob("**/*.onnx"))
+        return [path]
+
+    def _piper_config_for(self, model_path):
+        model_path = Path(model_path)
+        configs = (
+            Path(str(model_path) + ".json"),
+            model_path.with_suffix(".json"),
+        )
+        for config in configs:
+            if config.exists():
+                return str(config)
+        return None
+
+    def _warn_once(self, key, message):
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        print(message, file=sys.stderr)
 
     def _audio_player_cmd(self, wav_path):
         players = (
@@ -243,23 +291,36 @@ class AudioNotifier:
                 try:
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
                         wav_path = fh.name
-                    subprocess.run(
-                        [self._speaker, "--model", self._piper_model, "--output_file", wav_path],
+                    cmd = [
+                        self._speaker,
+                        "--model", self._piper_model,
+                        "--config", self._piper_config,
+                        "--output_file", wav_path,
+                    ]
+                    result = subprocess.run(
+                        cmd,
                         input=f"{text}\n".encode("utf-8"),
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=10,
                         check=False,
                     )
+                    if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                        self._warn_once("piper_run", "Audio: Piper failed to synthesize speech.")
+                        return
                     player = self._audio_player_cmd(wav_path)
                     if player:
-                        subprocess.run(
+                        result = subprocess.run(
                             player,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             timeout=8,
                             check=False,
                         )
+                        if result.returncode != 0:
+                            self._warn_once("piper_play", "Audio: Piper generated speech, but playback failed.")
+                    else:
+                        self._warn_once("piper_player_runtime", "Audio: No WAV player available for Piper output.")
                 finally:
                     if wav_path:
                         try:
