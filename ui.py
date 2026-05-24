@@ -25,12 +25,14 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import warnings
+import wave
 from pathlib import Path
 
 try:
@@ -134,7 +136,7 @@ PIPER_MODEL_CANDIDATES = (
 
 
 class AudioNotifier:
-    """Small non-blocking voice/beep helper for dashcam prompts."""
+    """Small non-blocking voice/tone helper for dashcam prompts."""
 
     def __init__(
         self,
@@ -260,7 +262,7 @@ class AudioNotifier:
                 return [path] + args
         return None
 
-    def say(self, text, key=None, min_interval=0.0, beep=False):
+    def say(self, text, key=None, min_interval=0.0, warning_tone=False):
         if not self.enabled:
             return
 
@@ -271,20 +273,26 @@ class AudioNotifier:
             return
         self._last_spoken[key] = now
 
-        if beep:
-            QApplication.beep()
-        if not self._speaker:
+        if not self._speaker and not warning_tone:
             return
 
-        thread = threading.Thread(target=self._speak, args=(text,), daemon=True)
+        thread = threading.Thread(
+            target=self._speak,
+            args=(text, warning_tone),
+            daemon=True,
+        )
         thread.start()
 
-    def _speak(self, text):
+    def _speak(self, text, warning_tone=False):
         with self._lock:
             if self._busy:
                 return
             self._busy = True
         try:
+            if warning_tone:
+                self._play_warning_tone_blocking()
+            if not self._speaker:
+                return
             name = Path(self._speaker).name
             if name == "piper":
                 wav_path = None
@@ -361,6 +369,59 @@ class AudioNotifier:
         finally:
             with self._lock:
                 self._busy = False
+
+    def _play_warning_tone_blocking(self):
+        wav_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                wav_path = fh.name
+            self._write_warning_tone(wav_path)
+            player = self._audio_player_cmd(wav_path)
+            if player:
+                result = subprocess.run(
+                    player,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=4,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return
+            QApplication.beep()
+        except Exception:
+            QApplication.beep()
+        finally:
+            if wav_path:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    def _write_warning_tone(self, wav_path):
+        sample_rate = 22050
+        segments = (
+            (880.0, 0.16),
+            (0.0, 0.06),
+            (880.0, 0.16),
+            (0.0, 0.06),
+            (660.0, 0.22),
+        )
+        amplitude = 0.35
+        samples = []
+        for freq, duration in segments:
+            count = int(sample_rate * duration)
+            for i in range(count):
+                if freq <= 0.0:
+                    value = 0.0
+                else:
+                    fade = min(1.0, i / 120.0, (count - i) / 120.0)
+                    value = amplitude * fade * math.sin(2.0 * math.pi * freq * i / sample_rate)
+                samples.append(struct.pack("<h", int(max(-1.0, min(1.0, value)) * 32767)))
+        with wave.open(wav_path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(b"".join(samples))
 
 
 def configure_qt_environment(qt_platform=None):
@@ -1277,7 +1338,7 @@ class MainWindow(QMainWindow):
                 "Attention. Drowsiness detected.",
                 key="drowsy_alert",
                 min_interval=self.audio.alert_interval,
-                beep=True,
+                warning_tone=True,
             )
         elif label == 0 and self._last_audio_label == 1:
             self.audio.say("Driver alert.", key="alert_clear", min_interval=5.0)
@@ -1285,7 +1346,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg):
         self._last_error = msg[:80]
-        self.audio.say("System alert.", key="system_error", min_interval=10.0, beep=True)
+        self.audio.say("System alert.", key="system_error", min_interval=10.0)
         self.cam_widget.set_metrics({
             "prob": None,
             "label": None,
@@ -1357,7 +1418,7 @@ def parse_args():
     ap.add_argument("--calibration-frames", type=int, default=DEFAULT_CALIBRATION_FRAMES,
                     help="Detected face frames to collect for startup normalization")
     ap.add_argument("--mute-audio", action="store_true",
-                    help="Disable voice prompts and alert beeps")
+                    help="Disable voice prompts and drowsiness warning tone")
     ap.add_argument("--audio-alert-interval", type=float, default=8.0,
                     help="Minimum seconds between repeated drowsiness audio alerts")
     ap.add_argument("--audio-engine", default="piper",
