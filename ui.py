@@ -8,6 +8,7 @@ Designed for Raspberry Pi 5 (Bookworm) + capacitive display.
 Install
 -------
   sudo apt install python3-pyqt5 python3-picamera2
+  sudo apt install speech-dispatcher espeak-ng   # optional voice prompts
   # or: pip install PyQt5 --break-system-packages
 
 Usage
@@ -22,7 +23,10 @@ import collections
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -118,6 +122,71 @@ P = {
 }
 
 DEFAULT_CALIBRATION_FRAMES = 90
+
+
+class AudioNotifier:
+    """Small non-blocking voice/beep helper for dashcam prompts."""
+
+    def __init__(self, enabled=True, alert_interval=8.0):
+        self.enabled = bool(enabled)
+        self.alert_interval = max(1.0, float(alert_interval))
+        self._last_spoken = {}
+        self._busy = False
+        self._lock = threading.Lock()
+        self._speaker = self._find_speaker()
+
+    def _find_speaker(self):
+        for cmd in ("spd-say", "espeak-ng", "espeak", "say"):
+            path = shutil.which(cmd)
+            if path:
+                return path
+        return None
+
+    def say(self, text, key=None, min_interval=0.0, beep=False):
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        key = key or text
+        last = self._last_spoken.get(key, -1e9)
+        if now - last < float(min_interval):
+            return
+        self._last_spoken[key] = now
+
+        if beep:
+            QApplication.beep()
+        if not self._speaker:
+            return
+
+        thread = threading.Thread(target=self._speak, args=(text,), daemon=True)
+        thread.start()
+
+    def _speak(self, text):
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+        try:
+            name = Path(self._speaker).name
+            if name == "spd-say":
+                cmd = [self._speaker, text]
+            elif name in ("espeak", "espeak-ng"):
+                cmd = [self._speaker, "-s", "155", text]
+            else:
+                cmd = [self._speaker, text]
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=6,
+                check=False,
+            )
+        except Exception:
+            return
+        finally:
+            with self._lock:
+                self._busy = False
+
 
 def configure_qt_environment(qt_platform=None):
     """Keep OpenCV's bundled Qt plugins from hijacking PyQt startup."""
@@ -853,11 +922,20 @@ class MainWindow(QMainWindow):
         self.args = args
         self._paused = False
         self._last_error = ""
+        self._last_audio_calibration_state = None
+        self._last_audio_calibrated = False
+        self._last_audio_face_ok = None
+        self._last_audio_label = None
+        self.audio = AudioNotifier(
+            enabled=not getattr(args, "mute_audio", False),
+            alert_interval=getattr(args, "audio_alert_interval", 8.0),
+        )
 
         self.setStyleSheet(GLOBAL_QSS)
         self.setWindowTitle("DrowsGuard Dashcam")
         self._build_ui()
         self._start_worker()
+        QTimer.singleShot(700, self._play_startup_instruction)
 
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
@@ -872,6 +950,16 @@ class MainWindow(QMainWindow):
         self.cam_widget = CameraWidget()
         self.cam_widget.calibration_requested.connect(self._start_normalization)
         root.addWidget(self.cam_widget)
+
+    def _play_startup_instruction(self):
+        if getattr(self.args, "alert_clip", None):
+            self.audio.say("Calibration loaded. Monitoring will start shortly.", key="startup")
+        else:
+            self.audio.say(
+                "Face forward with eyes open, then press start to normalize.",
+                key="cal_wait",
+                min_interval=12.0,
+            )
 
     def _start_worker(self):
         source = getattr(self.args, 'source', '0')
@@ -898,6 +986,7 @@ class MainWindow(QMainWindow):
         self._last_error = ""
         if hasattr(self.worker, "start_calibration"):
             self.worker.start_calibration()
+        self.audio.say("Hold still. Normalizing driver.", key="normalize_start", min_interval=2.0)
         metrics = dict(self.cam_widget._metrics)
         metrics.update({
             "prob": None,
@@ -915,9 +1004,81 @@ class MainWindow(QMainWindow):
         if self._last_error:
             metrics["error"] = self._last_error
         self.cam_widget.set_metrics(metrics)
+        self._handle_audio(metrics)
+
+    def _handle_audio(self, metrics):
+        if self._paused:
+            return
+
+        calibrated = bool(metrics.get("calibrated"))
+        calibration_state = str(metrics.get("calibration_state") or "waiting")
+        face_ok = bool(metrics.get("face_detected"))
+        warmup = bool(metrics.get("warmup"))
+        label = metrics.get("label")
+
+        if not calibrated:
+            if calibration_state != self._last_audio_calibration_state:
+                if calibration_state == "waiting":
+                    self.audio.say(
+                        "Face forward with eyes open, then press start to normalize.",
+                        key="cal_wait",
+                        min_interval=12.0,
+                    )
+                elif calibration_state == "calibrating":
+                    self.audio.say(
+                        "Hold still. Keep your face in view.",
+                        key="cal_active",
+                        min_interval=5.0,
+                    )
+                elif calibration_state == "no_face":
+                    self.audio.say(
+                        "Face not detected. Move into view.",
+                        key="cal_no_face",
+                        min_interval=4.0,
+                    )
+            elif calibration_state == "no_face":
+                self.audio.say(
+                    "Face not detected. Move into view.",
+                    key="cal_no_face",
+                    min_interval=6.0,
+                )
+            self._last_audio_calibration_state = calibration_state
+            self._last_audio_calibrated = False
+            return
+
+        if calibrated and not self._last_audio_calibrated:
+            self.audio.say("Normalization complete. Monitoring started.", key="cal_done")
+        self._last_audio_calibrated = True
+        self._last_audio_calibration_state = calibration_state
+
+        if not face_ok:
+            self.audio.say(
+                "Face not detected.",
+                key="no_face",
+                min_interval=7.0,
+            )
+            self._last_audio_face_ok = False
+            self._last_audio_label = None
+            return
+
+        if self._last_audio_face_ok is False:
+            self.audio.say("Face detected. Monitoring resumed.", key="face_back", min_interval=5.0)
+        self._last_audio_face_ok = True
+
+        if label == 1 and not warmup:
+            self.audio.say(
+                "Drowsiness detected. Please stay alert.",
+                key="drowsy_alert",
+                min_interval=self.audio.alert_interval,
+                beep=True,
+            )
+        elif label == 0 and self._last_audio_label == 1:
+            self.audio.say("Driver alert.", key="alert_clear", min_interval=5.0)
+        self._last_audio_label = label
 
     def _on_error(self, msg):
         self._last_error = msg[:80]
+        self.audio.say("System error.", key="system_error", min_interval=10.0, beep=True)
         self.cam_widget.set_metrics({
             "prob": None,
             "label": None,
@@ -935,8 +1096,10 @@ class MainWindow(QMainWindow):
         self._paused = not self._paused
         if self._paused:
             self.worker.pause()
+            self.audio.say("Paused.", key="paused")
         else:
             self.worker.resume()
+            self.audio.say("Resumed.", key="resumed")
         metrics = dict(self.cam_widget._metrics)
         metrics["paused"] = self._paused
         self.cam_widget.set_metrics(metrics)
@@ -983,6 +1146,10 @@ def parse_args():
                     help="Requested Picamera2 frame rate for numeric camera sources")
     ap.add_argument("--calibration-frames", type=int, default=DEFAULT_CALIBRATION_FRAMES,
                     help="Detected face frames to collect for startup normalization")
+    ap.add_argument("--mute-audio", action="store_true",
+                    help="Disable voice prompts and alert beeps")
+    ap.add_argument("--audio-alert-interval", type=float, default=8.0,
+                    help="Minimum seconds between repeated drowsiness audio alerts")
     ap.add_argument("--qt-platform", default=None,
                     choices=["xcb", "wayland", "eglfs", "linuxfb", "offscreen", "minimal"],
                     help="Override Qt platform plugin if auto-detection is wrong")
