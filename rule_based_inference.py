@@ -559,6 +559,19 @@ def angle_delta_deg(value, baseline):
     return wrap_angle_deg(float(value) - float(baseline))
 
 
+def clamp01(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def ramp_score(value, start, full):
+    start = float(start)
+    full = float(full)
+    value = float(value)
+    if full <= start:
+        return 1.0 if value >= full else 0.0
+    return clamp01((value - start) / (full - start))
+
+
 def compute_ear(lm, eye_idx):
     v1 = _dist(lm[eye_idx[1]], lm[eye_idx[5]])
     v2 = _dist(lm[eye_idx[2]], lm[eye_idx[4]])
@@ -829,20 +842,34 @@ class RuleState:
         self.yawn_frames = 0
         self.pose_frames = 0
         self.missing_frames = 0
+        self.alert_frames = 0
+        self.clear_frames = 0
+        self.alert_label = 0
+        self.smoothed_score = 0.0
         self.pose_baseline = None
+        self.feature_baseline = None
         self.pose_samples = []
 
     def start_calibration(self):
         self.closed_window.clear()
         self.reset_face_state()
         self.missing_frames = 0
+        self.alert_frames = 0
+        self.clear_frames = 0
+        self.alert_label = 0
+        self.smoothed_score = 0.0
         self.pose_baseline = None
+        self.feature_baseline = None
         self.pose_samples = []
 
     def reset_face_state(self):
         self.closed_frames = 0
         self.yawn_frames = 0
         self.pose_frames = 0
+        self.alert_frames = 0
+        self.clear_frames = 0
+        self.alert_label = 0
+        self.smoothed_score = 0.0
 
     @property
     def calibration_required(self):
@@ -850,22 +877,137 @@ class RuleState:
 
     @property
     def calibrated(self):
-        return self.pose_baseline is not None or self.calibration_required == 0
+        return self.feature_baseline is not None or self.calibration_required == 0
 
     def _update_pose_baseline(self, measurements):
         if self.calibrated:
             return True
-        self.pose_samples.append([measurements["pitch"], measurements["yaw"], measurements["roll"]])
+        self.pose_samples.append([
+            measurements["pitch"],
+            measurements["yaw"],
+            measurements["roll"],
+            measurements["ear"],
+            measurements["mar"],
+        ])
         if len(self.pose_samples) >= self.calibration_required:
-            self.pose_baseline = circular_mean_deg(np.array(self.pose_samples, dtype=np.float32))
+            samples = np.array(self.pose_samples, dtype=np.float32)
+            self.pose_baseline = circular_mean_deg(samples[:, :3])
+            self.feature_baseline = {
+                "ear": float(np.median(samples[:, 3])),
+                "mar": float(np.median(samples[:, 4])),
+            }
             return True
         return False
+
+    def _normal_baseline(self):
+        if self.feature_baseline is not None:
+            ear_base = max(0.08, float(self.feature_baseline.get("ear", 0.28)))
+            mar_base = max(0.005, float(self.feature_baseline.get("mar", 0.025)))
+        else:
+            ear_base = max(0.20, float(self.args.ear_threshold) / 0.72)
+            mar_base = max(0.02, float(self.args.mar_threshold) * 0.45)
+        return ear_base, mar_base
+
+    def _eye_score(self, ear):
+        ear_base, _ = self._normal_baseline()
+        eye_drop = max(0.0, ear_base - float(ear))
+        eye_score = ramp_score(
+            eye_drop,
+            max(0.015, ear_base * 0.10),
+            max(0.055, ear_base * 0.38),
+        )
+        if ear <= self.args.ear_threshold:
+            eye_score = max(eye_score, 0.85)
+        return clamp01(eye_score)
+
+    def _yawn_score(self, mar):
+        _, mar_base = self._normal_baseline()
+        mar_rise = max(0.0, float(mar) - mar_base)
+        yawn_score = ramp_score(
+            mar_rise,
+            max(0.015, mar_base * 0.55),
+            max(0.060, mar_base * 1.80),
+        )
+        if mar >= self.args.mar_threshold:
+            yawn_score = max(yawn_score, 0.70)
+        return clamp01(yawn_score)
+
+    def _component_scores(self, ear, mar, perclos, pitch_delta, yaw_delta, roll_delta):
+        eye_score = self._eye_score(ear)
+        yawn_score = self._yawn_score(mar)
+        pose_ratio = max(
+            abs(float(pitch_delta)) / max(1.0, float(self.args.pitch_threshold)),
+            abs(float(yaw_delta)) / max(1.0, float(self.args.yaw_threshold)),
+            abs(float(roll_delta)) / max(1.0, float(self.args.roll_threshold)),
+        )
+        pose_score = ramp_score(pose_ratio, 0.35, 1.0)
+
+        perclos_score = ramp_score(
+            perclos,
+            max(0.02, float(self.args.perclos_threshold) * 0.45),
+            max(0.05, float(self.args.perclos_threshold)),
+        )
+
+        fused = (
+            0.40 * eye_score +
+            0.30 * perclos_score +
+            0.20 * pose_score +
+            0.10 * yawn_score
+        )
+
+        alpha = clamp01(self.args.fusion_smoothing)
+        self.smoothed_score = (alpha * self.smoothed_score) + ((1.0 - alpha) * fused)
+        return {
+            "eye_score": eye_score,
+            "perclos_score": clamp01(perclos_score),
+            "pose_score": clamp01(pose_score),
+            "yawn_score": yawn_score,
+            "fused_score": clamp01(fused),
+            "drowsiness_score": clamp01(self.smoothed_score),
+        }
+
+    def _update_fusion_label(self, score):
+        alert_required = max(1, int(float(self.args.fusion_alert_seconds) * self.fps))
+        clear_required = max(1, int(float(self.args.fusion_clear_seconds) * self.fps))
+        if score >= self.args.fusion_alert_threshold:
+            self.alert_frames += 1
+        else:
+            self.alert_frames = 0
+        if score <= self.args.fusion_clear_threshold:
+            self.clear_frames += 1
+        else:
+            self.clear_frames = 0
+
+        if not self.alert_label and self.alert_frames >= alert_required:
+            self.alert_label = 1
+        elif self.alert_label and self.clear_frames >= clear_required:
+            self.alert_label = 0
+        return self.alert_label
+
+    def _fusion_reason(self, scores, label):
+        if not label:
+            return "OK"
+        ranked = [
+            ("EYES", scores["eye_score"]),
+            ("PERCLOS", scores["perclos_score"]),
+            ("HEAD", scores["pose_score"]),
+            ("YAWN", scores["yawn_score"]),
+        ]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        reasons = [name for name, value in ranked if value >= 0.35][:2]
+        return " + ".join(reasons) if reasons else "FUSION"
 
     def waiting_rule(self, face_ok):
         return {
             "label": None,
             "reason": "WAITING",
             "perclos": 0.0,
+            "drowsiness_score": 0.0,
+            "eye_score": 0.0,
+            "perclos_score": 0.0,
+            "pose_score": 0.0,
+            "yawn_score": 0.0,
+            "fused_score": 0.0,
             "closed": False,
             "yawn": False,
             "bad_pose": False,
@@ -881,13 +1023,18 @@ class RuleState:
     def update(self, measurements, face_ok):
         if not face_ok:
             self.missing_frames += 1
-            if self.missing_frames >= int(self.args.no_face_reset * self.fps):
-                self.closed_window.clear()
-                self.reset_face_state()
+            self.closed_window.clear()
+            self.reset_face_state()
             return {
                 "label": 0,
                 "reason": "NO FACE",
                 "perclos": 0.0,
+                "drowsiness_score": 0.0,
+                "eye_score": 0.0,
+                "perclos_score": 0.0,
+                "pose_score": 0.0,
+                "yawn_score": 0.0,
+                "fused_score": 0.0,
                 "closed": False,
                 "yawn": False,
                 "bad_pose": False,
@@ -906,6 +1053,12 @@ class RuleState:
                 "label": None,
                 "reason": "CALIBRATING",
                 "perclos": 0.0,
+                "drowsiness_score": 0.0,
+                "eye_score": 0.0,
+                "perclos_score": 0.0,
+                "pose_score": 0.0,
+                "yawn_score": 0.0,
+                "fused_score": 0.0,
                 "closed": False,
                 "yawn": False,
                 "bad_pose": False,
@@ -929,42 +1082,32 @@ class RuleState:
             yaw_delta = angle_delta_deg(measurements["yaw"], self.pose_baseline[1])
             roll_delta = angle_delta_deg(measurements["roll"], self.pose_baseline[2])
 
-        closed = ear < self.args.ear_threshold
-        yawn = mar > self.args.mar_threshold
-        bad_pose = (
-            abs(pitch_delta) > self.args.pitch_threshold or
-            abs(yaw_delta) > self.args.yaw_threshold or
-            abs(roll_delta) > self.args.roll_threshold
-        )
-
+        preliminary_eye = self._eye_score(ear)
+        closed = preliminary_eye >= 0.65
         self.closed_window.append(1 if closed else 0)
         perclos = float(np.mean(self.closed_window)) if self.closed_window else 0.0
+        scores = self._component_scores(ear, mar, perclos, pitch_delta, yaw_delta, roll_delta)
+
+        closed = scores["eye_score"] >= 0.65
+        yawn = scores["yawn_score"] >= 0.65
+        bad_pose = scores["pose_score"] >= 0.65
         self.closed_frames = self.closed_frames + 1 if closed else 0
         self.yawn_frames = self.yawn_frames + 1 if yawn else 0
         self.pose_frames = self.pose_frames + 1 if bad_pose else 0
 
-        closed_long = self.closed_frames >= int(self.args.eye_closed_seconds * self.fps)
-        yawn_long = self.yawn_frames >= int(self.args.yawn_seconds * self.fps)
-        pose_long = self.pose_frames >= int(self.args.pose_seconds * self.fps)
-        perclos_high = (
-            len(self.closed_window) >= int(min(self.args.perclos_window, 3.0) * self.fps) and
-            perclos >= self.args.perclos_threshold
-        )
-
-        reasons = []
-        if closed_long:
-            reasons.append("EYES CLOSED")
-        if perclos_high:
-            reasons.append("HIGH PERCLOS")
-        if yawn_long:
-            reasons.append("YAWN")
-        if pose_long:
-            reasons.append("HEAD POSE")
+        label = self._update_fusion_label(scores["drowsiness_score"])
+        reason = self._fusion_reason(scores, label)
 
         return {
-            "label": 1 if reasons else 0,
-            "reason": " + ".join(reasons) if reasons else "OK",
+            "label": label,
+            "reason": reason,
             "perclos": perclos,
+            "drowsiness_score": scores["drowsiness_score"],
+            "eye_score": scores["eye_score"],
+            "perclos_score": scores["perclos_score"],
+            "pose_score": scores["pose_score"],
+            "yawn_score": scores["yawn_score"],
+            "fused_score": scores["fused_score"],
             "closed": closed,
             "yawn": yawn,
             "bad_pose": bad_pose,
@@ -1095,6 +1238,12 @@ class RuleWorker(QThread):
                     "label": rule["label"],
                     "reason": rule["reason"],
                     "perclos": rule["perclos"],
+                    "drowsiness_score": rule["drowsiness_score"],
+                    "eye_score": rule["eye_score"],
+                    "perclos_score": rule["perclos_score"],
+                    "pose_score": rule["pose_score"],
+                    "yawn_score": rule["yawn_score"],
+                    "fused_score": rule["fused_score"],
                     "closed": rule["closed"],
                     "yawn": rule["yawn"],
                     "bad_pose": rule["bad_pose"],
@@ -1137,6 +1286,12 @@ class CameraWidget(QWidget):
             "label": None,
             "reason": "Starting",
             "perclos": 0.0,
+            "drowsiness_score": 0.0,
+            "eye_score": 0.0,
+            "perclos_score": 0.0,
+            "pose_score": 0.0,
+            "yawn_score": 0.0,
+            "fused_score": 0.0,
             "face_detected": False,
             "warmup": True,
             "fps": 0.0,
@@ -1193,6 +1348,7 @@ class CameraWidget(QWidget):
         paused = bool(self._metrics.get("paused"))
         error = str(self._metrics.get("error") or "")
         perclos = max(0.0, min(1.0, float(self._metrics.get("perclos") or 0.0)))
+        score = max(0.0, min(1.0, float(self._metrics.get("drowsiness_score") or 0.0)))
         fps = float(self._metrics.get("fps") or 0.0)
 
         painter.fillRect(0, 0, width, top_h, QColor(0, 0, 0, 150))
@@ -1223,11 +1379,11 @@ class CameraWidget(QWidget):
         elif label == 1:
             status = "ALERT" if tiny else reason
             color = QColor(P["red"])
-            right_text = f"PERCLOS {perclos * 100:.0f}%"
+            right_text = f"Score {score * 100:.0f}%"
         else:
             status = "OK" if tiny else "Driver alert"
             color = QColor(P["green"])
-            right_text = f"PERCLOS {perclos * 100:.0f}%"
+            right_text = f"Score {score * 100:.0f}%"
 
         painter.fillRect(0, height - bottom_h, width, bottom_h, QColor(0, 0, 0, 165))
         painter.setFont(QFont("DejaVu Sans", 11 if tiny else (12 if compact else 17), QFont.Bold))
@@ -1246,14 +1402,17 @@ class CameraWidget(QWidget):
         bar_y = height - 8 if tiny else (height - 12 if compact else height - 16)
         bar_h = 4 if tiny else (5 if compact else 7)
         painter.fillRect(bar_x, bar_y, bar_w, bar_h, QColor(90, 90, 90, 170))
-        fill = progress if not calibrated else perclos
+        fill = progress if not calibrated else score
         if not calibrated or face_ok:
             painter.fillRect(bar_x, bar_y, int(bar_w * max(0.0, min(1.0, fill))), bar_h, color)
 
         if not tiny:
-            small = f"FPS {fps:.0f}   Face {'yes' if face_ok else 'no'}"
+            small = f"FPS {fps:.0f}   Face {'yes' if face_ok else 'no'}   PERCLOS {perclos * 100:.0f}%"
             if not compact:
                 small += (
+                    f"   E/H/Y {float(self._metrics.get('eye_score') or 0.0) * 100:.0f}/"
+                    f"{float(self._metrics.get('pose_score') or 0.0) * 100:.0f}/"
+                    f"{float(self._metrics.get('yawn_score') or 0.0) * 100:.0f}"
                     f"   EAR {float(self._metrics.get('ear') or 0.0):.3f}"
                     f"   MAR {float(self._metrics.get('mar') or 0.0):.3f}"
                     f"   dPose {float(self._metrics.get('pitch_delta') or 0.0):+.0f}/"
@@ -1560,15 +1719,29 @@ def parse_args():
     parser.add_argument("--mar-threshold", type=float, default=0.06, help="MAR above this means yawning")
     parser.add_argument("--perclos-threshold", type=float, default=0.35, help="Closed-eye fraction threshold")
     parser.add_argument("--perclos-window", type=float, default=20.0, help="Rolling PERCLOS window in seconds")
-    parser.add_argument("--eye-closed-seconds", type=float, default=1.5, help="Continuous eye closure trigger")
-    parser.add_argument("--yawn-seconds", type=float, default=1.0, help="Continuous yawn trigger")
-    parser.add_argument("--pose-seconds", type=float, default=1.2, help="Continuous bad head-pose trigger")
+    parser.add_argument("--eye-closed-seconds", type=float, default=1.5,
+                        help="Legacy option kept for compatibility; fusion scoring is used for alerts")
+    parser.add_argument("--yawn-seconds", type=float, default=1.0,
+                        help="Legacy option kept for compatibility; fusion scoring is used for alerts")
+    parser.add_argument("--pose-seconds", type=float, default=1.2,
+                        help="Legacy option kept for compatibility; fusion scoring is used for alerts")
     parser.add_argument("--pose-calibration-seconds", type=float, default=2.0,
                         help="Seconds used to learn neutral head pose after START")
     parser.add_argument("--pitch-threshold", type=float, default=28.0, help="Relative pitch threshold in degrees")
     parser.add_argument("--yaw-threshold", type=float, default=38.0, help="Relative yaw threshold in degrees")
     parser.add_argument("--roll-threshold", type=float, default=35.0, help="Relative roll threshold in degrees")
-    parser.add_argument("--no-face-reset", type=float, default=0.5, help="Seconds without face before clearing state")
+    parser.add_argument("--fusion-alert-threshold", type=float, default=0.58,
+                        help="Smoothed fusion score required to enter alert state")
+    parser.add_argument("--fusion-clear-threshold", type=float, default=0.35,
+                        help="Smoothed fusion score required to clear alert state")
+    parser.add_argument("--fusion-alert-seconds", type=float, default=0.7,
+                        help="Seconds fusion score must stay high before alerting")
+    parser.add_argument("--fusion-clear-seconds", type=float, default=0.8,
+                        help="Seconds fusion score must stay low before clearing")
+    parser.add_argument("--fusion-smoothing", type=float, default=0.82,
+                        help="EMA smoothing factor for fusion score; higher is steadier but slower")
+    parser.add_argument("--no-face-reset", type=float, default=0.5,
+                        help="Legacy option kept for compatibility; no-face state now clears immediately")
     parser.add_argument("--hide-face-overlay", action="store_true",
                         help="Hide EAR/MAR landmarks and head-pose axes on the camera feed")
     parser.add_argument("--auto-calibrate", action="store_true",
