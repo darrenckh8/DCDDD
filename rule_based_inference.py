@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-Rule-based drowsiness inference
-===============================
-Standalone live detector using only:
-  - EAR
-  - MAR
-  - head pose
-  - PERCLOS
-
-No Keras/TFLite drowsiness model is loaded. MediaPipe is used only to obtain
-face landmarks for the measurements.
+Rule-based dashcam UI
+=====================
+Standalone drowsiness detector using only EAR, MAR, head pose, and PERCLOS.
+No Keras/TFLite model is loaded.
 
 Usage
 -----
   python rule_based_inference.py
-  python rule_based_inference.py --source path/to/video.mp4
+  python rule_based_inference.py --source path/to/video.mp4 --no-fullscreen
   python rule_based_inference.py --ear-threshold 0.20 --perclos-threshold 0.35
 """
 
 import argparse
 import collections
+import math
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
 import time
+import wave
 from pathlib import Path
 
 try:
@@ -33,12 +36,26 @@ except ModuleNotFoundError as exc:
         "Activate your project virtualenv and install required packages."
     ) from exc
 
+for _qt_env_name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
+    if "cv2" in os.environ.get(_qt_env_name, "").lower():
+        os.environ.pop(_qt_env_name, None)
+
 try:
     from picamera2 import Picamera2
     PICAMERA2_AVAILABLE = True
 except ModuleNotFoundError:
     Picamera2 = None
     PICAMERA2_AVAILABLE = False
+
+try:
+    from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QRect, QLibraryInfo
+    from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QFont
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSizePolicy
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        f"Missing dependency '{exc.name}'. "
+        "Install PyQt5 or activate your project virtualenv."
+    ) from exc
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,6 +77,333 @@ MODEL_3D = np.array([
     (28.9, -28.9, -24.1),
 ], dtype=np.float64)
 DIST_COEFFS = np.zeros((4, 1), dtype=np.float64)
+
+P = {
+    "green": "#2e7d32",
+    "red": "#c62828",
+    "amber": "#f9a825",
+    "white": "#f1f3f4",
+    "dim": "#a8b0b8",
+    "dimmer": "#7b848d",
+}
+
+PIPER_MODEL_CANDIDATES = (
+    "piper_voice.onnx",
+    "voice.onnx",
+    "en_US-amy-medium.onnx",
+    "en_US-lessac-medium.onnx",
+    "en_US-ryan-medium.onnx",
+)
+
+
+class AudioNotifier:
+    """Small non-blocking voice/tone helper matching ui.py."""
+
+    def __init__(
+        self,
+        enabled=True,
+        alert_interval=8.0,
+        engine="piper",
+        voice=None,
+        rate=132,
+    ):
+        self.enabled = bool(enabled)
+        self.alert_interval = max(1.0, float(alert_interval))
+        self.engine = engine
+        self.voice = voice
+        self.rate = max(80, min(260, int(rate)))
+        self._last_spoken = {}
+        self._busy = False
+        self._lock = threading.Lock()
+        self._piper_model = None
+        self._piper_config = None
+        self._warned = set()
+        self._speaker = self._find_speaker()
+
+    def _find_speaker(self):
+        fallback = ("piper", "flite", "espeak-ng", "espeak", "say", "spd-say")
+        if self.engine and self.engine != "auto":
+            candidates = (self.engine,) + tuple(c for c in fallback if c != self.engine)
+        else:
+            candidates = fallback
+        for cmd in candidates:
+            path = shutil.which(cmd)
+            if not path:
+                continue
+            if cmd == "piper":
+                model = self._find_piper_model()
+                if not model:
+                    self._warn_once(
+                        "piper_model",
+                        "Audio: Piper found, but no Piper .onnx voice model with matching config was found.",
+                    )
+                    continue
+                player = self._audio_player_cmd("__probe__.wav")
+                if not player:
+                    self._warn_once(
+                        "piper_player",
+                        "Audio: Piper voice found, but no WAV player found. Install alsa-utils for aplay.",
+                    )
+                    continue
+                self._piper_model = model
+            return path
+        return None
+
+    def _find_piper_model(self):
+        candidates = []
+        if self.voice:
+            candidates.extend(self._piper_model_candidates_from_path(Path(self.voice).expanduser()))
+        env_model = os.environ.get("PIPER_MODEL")
+        if env_model:
+            candidates.extend(self._piper_model_candidates_from_path(Path(env_model).expanduser()))
+        candidates.extend(BASE_DIR / name for name in PIPER_MODEL_CANDIDATES)
+        candidates.extend(sorted(BASE_DIR.glob("*.onnx")))
+        for folder in (BASE_DIR / "voices", BASE_DIR / "piper_voices"):
+            if folder.exists():
+                candidates.extend(sorted(folder.glob("**/*.onnx")))
+
+        for candidate in candidates:
+            if not candidate.exists() or candidate.suffix != ".onnx":
+                continue
+            config = self._piper_config_for(candidate)
+            if config:
+                self._piper_config = config
+                return str(candidate)
+
+        for root in (Path("/usr/share/piper-voices"), Path("/usr/local/share/piper-voices")):
+            if not root.exists():
+                continue
+            for name in PIPER_MODEL_CANDIDATES[2:]:
+                matches = list(root.glob(f"**/{name}"))
+                if matches:
+                    config = self._piper_config_for(matches[0])
+                    if config:
+                        self._piper_config = config
+                        return str(matches[0])
+            for match in sorted(root.glob("**/*.onnx")):
+                config = self._piper_config_for(match)
+                if config:
+                    self._piper_config = config
+                    return str(match)
+        return None
+
+    def _piper_model_candidates_from_path(self, path):
+        if path.is_dir():
+            return sorted(path.glob("**/*.onnx"))
+        return [path]
+
+    def _piper_config_for(self, model_path):
+        model_path = Path(model_path)
+        configs = (
+            Path(str(model_path) + ".json"),
+            model_path.with_suffix(".json"),
+        )
+        for config in configs:
+            if config.exists():
+                return str(config)
+        return None
+
+    def _warn_once(self, key, message):
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        print(message, file=sys.stderr)
+
+    def _audio_player_cmd(self, wav_path):
+        players = (
+            ("aplay", ["-q", wav_path]),
+            ("paplay", [wav_path]),
+            ("pw-play", [wav_path]),
+            ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet", wav_path]),
+            ("afplay", [wav_path]),
+        )
+        for name, args in players:
+            path = shutil.which(name)
+            if path:
+                return [path] + args
+        return None
+
+    def say(self, text, key=None, min_interval=0.0, warning_tone=False):
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        key = key or text
+        last = self._last_spoken.get(key, -1e9)
+        if now - last < float(min_interval):
+            return
+        self._last_spoken[key] = now
+
+        if not self._speaker and not warning_tone:
+            return
+
+        thread = threading.Thread(
+            target=self._speak,
+            args=(text, warning_tone),
+            daemon=True,
+        )
+        thread.start()
+
+    def _speak(self, text, warning_tone=False):
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+        try:
+            if warning_tone:
+                self._play_warning_tone_blocking()
+            if not self._speaker:
+                return
+            name = Path(self._speaker).name
+            if name == "piper":
+                wav_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                        wav_path = fh.name
+                    cmd = [
+                        self._speaker,
+                        "--model", self._piper_model,
+                        "--config", self._piper_config,
+                        "--output_file", wav_path,
+                    ]
+                    result = subprocess.run(
+                        cmd,
+                        input=f"{text}\n".encode("utf-8"),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                    if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                        self._warn_once("piper_run", "Audio: Piper failed to synthesize speech.")
+                        return
+                    player = self._audio_player_cmd(wav_path)
+                    if player:
+                        result = subprocess.run(
+                            player,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=8,
+                            check=False,
+                        )
+                        if result.returncode != 0:
+                            self._warn_once("piper_play", "Audio: Piper generated speech, but playback failed.")
+                    else:
+                        self._warn_once("piper_player_runtime", "Audio: No WAV player available for Piper output.")
+                finally:
+                    if wav_path:
+                        try:
+                            os.unlink(wav_path)
+                        except OSError:
+                            pass
+                return
+            if name == "flite":
+                voice = self.voice or "slt"
+                cmd = [self._speaker, "-voice", voice, "-t", text]
+            elif name in ("espeak", "espeak-ng"):
+                voice = self.voice or "en-us+f4"
+                cmd = [
+                    self._speaker, "-v", voice,
+                    "-s", str(self.rate),
+                    "-p", "42",
+                    "-g", "5",
+                    text,
+                ]
+            elif name == "say":
+                cmd = [self._speaker]
+                if self.voice:
+                    cmd.extend(["-v", self.voice])
+                cmd.extend(["-r", str(self.rate), text])
+            elif name == "spd-say":
+                cmd = [self._speaker, "-r", "-45", text]
+            else:
+                cmd = [self._speaker, text]
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=6,
+                check=False,
+            )
+        except Exception:
+            return
+        finally:
+            with self._lock:
+                self._busy = False
+
+    def _play_warning_tone_blocking(self):
+        wav_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                wav_path = fh.name
+            self._write_warning_tone(wav_path)
+            player = self._audio_player_cmd(wav_path)
+            if player:
+                result = subprocess.run(
+                    player,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=4,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return
+            QApplication.beep()
+        except Exception:
+            QApplication.beep()
+        finally:
+            if wav_path:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    def _write_warning_tone(self, wav_path):
+        sample_rate = 22050
+        segments = (
+            (880.0, 0.16),
+            (0.0, 0.06),
+            (880.0, 0.16),
+            (0.0, 0.06),
+            (660.0, 0.22),
+        )
+        amplitude = 0.35
+        samples = []
+        for freq, duration in segments:
+            count = int(sample_rate * duration)
+            for i in range(count):
+                if freq <= 0.0:
+                    value = 0.0
+                else:
+                    fade = min(1.0, i / 120.0, (count - i) / 120.0)
+                    value = amplitude * fade * math.sin(2.0 * math.pi * freq * i / sample_rate)
+                samples.append(struct.pack("<h", int(max(-1.0, min(1.0, value)) * 32767)))
+        with wave.open(wav_path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(b"".join(samples))
+
+
+def configure_qt_environment(qt_platform=None):
+    """Keep OpenCV's bundled Qt plugins from hijacking PyQt startup."""
+    for name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
+        if "cv2" in os.environ.get(name, "").lower():
+            os.environ.pop(name, None)
+
+    plugin_path = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+    if plugin_path:
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+
+    if qt_platform:
+        os.environ["QT_QPA_PLATFORM"] = qt_platform
+    elif "QT_QPA_PLATFORM" not in os.environ:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            os.environ["QT_QPA_PLATFORM"] = "wayland"
+        elif os.environ.get("DISPLAY"):
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
+        else:
+            os.environ["QT_QPA_PLATFORM"] = "linuxfb"
 
 
 def _dist(a, b):
@@ -222,15 +566,54 @@ class RuleState:
         self.yawn_frames = 0
         self.pose_frames = 0
         self.missing_frames = 0
-        self.label = 0
-        self.reason = "OK"
+        self.pose_baseline = None
+        self.pose_samples = []
+
+    def start_calibration(self):
+        self.closed_window.clear()
+        self.reset_face_state()
+        self.missing_frames = 0
+        self.pose_baseline = None
+        self.pose_samples = []
 
     def reset_face_state(self):
         self.closed_frames = 0
         self.yawn_frames = 0
         self.pose_frames = 0
-        self.label = 0
-        self.reason = "NO FACE"
+
+    @property
+    def calibration_required(self):
+        return max(0, int(self.args.pose_calibration_seconds * self.fps))
+
+    @property
+    def calibrated(self):
+        return self.pose_baseline is not None or self.calibration_required == 0
+
+    def _update_pose_baseline(self, measurements):
+        if self.calibrated:
+            return True
+        self.pose_samples.append([measurements["pitch"], measurements["yaw"], measurements["roll"]])
+        if len(self.pose_samples) >= self.calibration_required:
+            self.pose_baseline = np.median(np.array(self.pose_samples, dtype=np.float32), axis=0)
+            return True
+        return False
+
+    def waiting_rule(self, face_ok):
+        return {
+            "label": None,
+            "reason": "WAITING",
+            "perclos": 0.0,
+            "closed": False,
+            "yawn": False,
+            "bad_pose": False,
+            "calibrated": self.calibrated,
+            "calibration_state": "ready" if self.calibrated else "waiting",
+            "calibration_progress": self.calibration_progress(),
+            "pitch_delta": 0.0,
+            "yaw_delta": 0.0,
+            "roll_delta": 0.0,
+            "warmup": True,
+        }
 
     def update(self, measurements, face_ok):
         if not face_ok:
@@ -245,21 +628,50 @@ class RuleState:
                 "closed": False,
                 "yawn": False,
                 "bad_pose": False,
+                "calibrated": self.calibrated,
+                "calibration_state": "ready" if self.calibrated else "no_face",
+                "calibration_progress": self.calibration_progress(),
+                "pitch_delta": 0.0,
+                "yaw_delta": 0.0,
+                "roll_delta": 0.0,
+                "warmup": True,
             }
 
         self.missing_frames = 0
+        if not self._update_pose_baseline(measurements):
+            return {
+                "label": None,
+                "reason": "CALIBRATING",
+                "perclos": 0.0,
+                "closed": False,
+                "yawn": False,
+                "bad_pose": False,
+                "calibrated": False,
+                "calibration_state": "calibrating",
+                "calibration_progress": self.calibration_progress(),
+                "pitch_delta": 0.0,
+                "yaw_delta": 0.0,
+                "roll_delta": 0.0,
+                "warmup": True,
+            }
+
         ear = measurements["ear"]
         mar = measurements["mar"]
-        pitch = measurements["pitch"]
-        yaw = measurements["yaw"]
-        roll = measurements["roll"]
+        if self.pose_baseline is None:
+            pitch_delta = measurements["pitch"]
+            yaw_delta = measurements["yaw"]
+            roll_delta = measurements["roll"]
+        else:
+            pitch_delta = measurements["pitch"] - float(self.pose_baseline[0])
+            yaw_delta = measurements["yaw"] - float(self.pose_baseline[1])
+            roll_delta = measurements["roll"] - float(self.pose_baseline[2])
 
         closed = ear < self.args.ear_threshold
         yawn = mar > self.args.mar_threshold
         bad_pose = (
-            abs(pitch) > self.args.pitch_threshold or
-            abs(yaw) > self.args.yaw_threshold or
-            abs(roll) > self.args.roll_threshold
+            abs(pitch_delta) > self.args.pitch_threshold or
+            abs(yaw_delta) > self.args.yaw_threshold or
+            abs(roll_delta) > self.args.roll_threshold
         )
 
         self.closed_window.append(1 if closed else 0)
@@ -286,16 +698,27 @@ class RuleState:
         if pose_long:
             reasons.append("HEAD POSE")
 
-        self.label = 1 if reasons else 0
-        self.reason = " + ".join(reasons) if reasons else "OK"
         return {
-            "label": self.label,
-            "reason": self.reason,
+            "label": 1 if reasons else 0,
+            "reason": " + ".join(reasons) if reasons else "OK",
             "perclos": perclos,
             "closed": closed,
             "yawn": yawn,
             "bad_pose": bad_pose,
+            "calibrated": True,
+            "calibration_state": "ready",
+            "calibration_progress": 1.0,
+            "pitch_delta": float(pitch_delta),
+            "yaw_delta": float(yaw_delta),
+            "roll_delta": float(roll_delta),
+            "warmup": False,
         }
+
+    def calibration_progress(self):
+        required = self.calibration_required
+        if required <= 0:
+            return 1.0
+        return min(1.0, len(self.pose_samples) / required)
 
 
 def create_landmarker():
@@ -314,131 +737,547 @@ def create_landmarker():
     return mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
 
-def draw_overlay(frame, measurements, state, rule, fps_display, frame_count):
-    height, width = frame.shape[:2]
-    label = rule["label"]
-    face_ok = measurements is not None
-    status = rule["reason"] if face_ok else "NO FACE"
-    color = (0, 0, 220) if label else ((0, 170, 255) if not face_ok else (0, 170, 0))
-
-    cv2.rectangle(frame, (0, 0), (width, 122), (15, 15, 15), -1)
-    cv2.putText(frame, status, (14, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 2, cv2.LINE_AA)
-    cv2.putText(
-        frame,
-        f"FPS {fps_display:.0f}  Frame {frame_count}",
-        (width - 210, 32),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (180, 180, 180),
-        1,
-        cv2.LINE_AA,
-    )
-
-    if measurements is None:
-        cv2.putText(
-            frame,
-            "Waiting for face",
-            (14, 78),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 170, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return frame
-
-    lines = [
-        f"EAR {measurements['ear']:.3f} < {state.args.ear_threshold:.3f}   "
-        f"PERCLOS {rule['perclos']:.2f} > {state.args.perclos_threshold:.2f}",
-        f"MAR {measurements['mar']:.3f} > {state.args.mar_threshold:.3f}   "
-        f"Pose P/Y/R {measurements['pitch']:+.1f}/{measurements['yaw']:+.1f}/{measurements['roll']:+.1f}",
-    ]
-    for i, line in enumerate(lines):
-        cv2.putText(
-            frame,
-            line,
-            (14, 68 + 28 * i),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-
-    bar_x, bar_y = 14, 108
-    bar_w = max(120, width - 28)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 8), (70, 70, 70), -1)
-    cv2.rectangle(
-        frame,
-        (bar_x, bar_y),
-        (bar_x + int(bar_w * min(1.0, rule["perclos"])), bar_y + 8),
-        color,
-        -1,
-    )
-    return frame
+class RuleSignals(QObject):
+    frame_ready = pyqtSignal(object, object)
+    error = pyqtSignal(str)
 
 
-def run(args):
-    cap = open_source(args.source, args.camera_width, args.camera_height, args.camera_fps)
-    landmarker = create_landmarker()
-    state = RuleState(args, cap.fps)
+class RuleWorker(QThread):
+    def __init__(self, args, parent=None):
+        super().__init__(parent)
+        self.args = args
+        self.signals = RuleSignals()
+        self._running = True
+        self._paused = False
+        self._calibration_requested = bool(getattr(args, "auto_calibrate", False))
+        self._calibration_reset_pending = False
 
-    ts_ms = 0.0
-    frame_count = 0
-    t_prev = time.perf_counter()
-    fps_display = 0.0
-    last_measurements = None
+    def pause(self):
+        self._paused = True
 
-    print("Rule-based drowsiness detector")
-    print(f"  EAR threshold:      {args.ear_threshold:.3f}")
-    print(f"  MAR threshold:      {args.mar_threshold:.3f}")
-    print(f"  PERCLOS threshold:  {args.perclos_threshold:.2f} over {args.perclos_window:.1f}s")
-    print("Press Q or Esc to quit.\n")
+    def resume(self):
+        self._paused = False
 
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                if cap.loop_source:
-                    cap.reset()
+    def start_calibration(self):
+        self._calibration_requested = True
+        self._calibration_reset_pending = True
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+    def run(self):
+        cap = None
+        landmarker = None
+        try:
+            cap = open_source(
+                self.args.source,
+                self.args.camera_width,
+                self.args.camera_height,
+                self.args.camera_fps,
+            )
+            landmarker = create_landmarker()
+            state = RuleState(self.args, cap.fps)
+            ts_ms = 0.0
+            frame_count = 0
+            t_prev = time.perf_counter()
+            fps_display = 0.0
+
+            while self._running:
+                if self._paused:
+                    time.sleep(0.05)
                     continue
-                break
+                if self._calibration_reset_pending:
+                    state.start_calibration()
+                    self._calibration_reset_pending = False
 
-            frame = rotate_frame(frame, args.rotation)
-            height, width = frame.shape[:2]
-            frame_count += 1
+                ok, frame = cap.read()
+                if not ok:
+                    if cap.loop_source:
+                        cap.reset()
+                        continue
+                    time.sleep(0.02)
+                    continue
 
-            now = time.perf_counter()
-            fps_display = 0.9 * fps_display + 0.1 / max(now - t_prev, 1e-6)
-            t_prev = now
+                frame = rotate_frame(frame, self.args.rotation)
+                height, width = frame.shape[:2]
+                frame_count += 1
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(image, int(ts_ms))
-            ts_ms += 1000.0 / max(cap.fps, 1.0)
+                now = time.perf_counter()
+                fps_display = 0.9 * fps_display + 0.1 / max(now - t_prev, 1e-6)
+                t_prev = now
 
-            face_ok = bool(result.face_landmarks)
-            if face_ok:
-                last_measurements = extract_measurements(result.face_landmarks[0], width, height)
-                rule = state.update(last_measurements, True)
-            else:
-                last_measurements = None
-                rule = state.update(None, False)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect_for_video(image, int(ts_ms))
+                ts_ms += 1000.0 / max(cap.fps, 1.0)
 
-            draw_overlay(frame, last_measurements, state, rule, fps_display, frame_count)
-            cv2.imshow("Rule-Based Drowsiness Detector", frame)
+                face_ok = bool(result.face_landmarks)
+                if face_ok:
+                    measurements = extract_measurements(result.face_landmarks[0], width, height)
+                else:
+                    measurements = {}
 
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
-                break
-    finally:
-        cap.release()
-        landmarker.close()
-        cv2.destroyAllWindows()
+                if not state.calibrated and not self._calibration_requested:
+                    rule = state.waiting_rule(face_ok)
+                elif face_ok:
+                    rule = state.update(measurements, True)
+                else:
+                    rule = state.update(None, False)
+
+                metrics = {
+                    "label": rule["label"],
+                    "reason": rule["reason"],
+                    "perclos": rule["perclos"],
+                    "closed": rule["closed"],
+                    "yawn": rule["yawn"],
+                    "bad_pose": rule["bad_pose"],
+                    "calibrated": rule["calibrated"],
+                    "calibration_state": rule["calibration_state"],
+                    "calibration_progress": rule["calibration_progress"],
+                    "warmup": rule["warmup"],
+                    "face_detected": face_ok,
+                    "fps": fps_display,
+                    "frame_count": frame_count,
+                    "ear": float(measurements.get("ear", 0.0)),
+                    "ear_l": float(measurements.get("ear_l", 0.0)),
+                    "ear_r": float(measurements.get("ear_r", 0.0)),
+                    "mar": float(measurements.get("mar", 0.0)),
+                    "pitch": float(measurements.get("pitch", 0.0)),
+                    "yaw": float(measurements.get("yaw", 0.0)),
+                    "roll": float(measurements.get("roll", 0.0)),
+                    "pitch_delta": rule["pitch_delta"],
+                    "yaw_delta": rule["yaw_delta"],
+                    "roll_delta": rule["roll_delta"],
+                }
+                self.signals.frame_ready.emit(frame, metrics)
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+        finally:
+            if cap is not None:
+                cap.release()
+            if landmarker is not None:
+                landmarker.close()
+
+
+class CameraWidget(QWidget):
+    calibration_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self._calibrate_rect = QRect()
+        self._metrics = {
+            "label": None,
+            "reason": "Starting",
+            "perclos": 0.0,
+            "face_detected": False,
+            "warmup": True,
+            "fps": 0.0,
+            "frame_count": 0,
+            "ear": 0.0,
+            "mar": 0.0,
+            "pitch_delta": 0.0,
+            "yaw_delta": 0.0,
+            "roll_delta": 0.0,
+            "calibrated": False,
+            "calibration_state": "waiting",
+            "calibration_progress": 0.0,
+            "paused": False,
+            "error": "",
+        }
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(240, 180)
+
+    def set_frame(self, frame_bgr):
+        height, width = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+        self._pixmap = QPixmap.fromImage(image)
+        self.update()
+
+    def set_metrics(self, metrics):
+        self._metrics = dict(metrics)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        width, height = self.width(), self.height()
+        painter.fillRect(0, 0, width, height, QColor("#050505"))
+
+        if self._pixmap is not None and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (width - scaled.width()) // 2
+            y = (height - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+
+        compact = width < 720 or height < 430
+        tiny = width < 360 or height < 260
+        margin = 8 if compact else 14
+        top_h = 24 if tiny else (28 if compact else 38)
+        bottom_h = 34 if tiny else (42 if compact else 58)
+
+        label = self._metrics.get("label")
+        reason = str(self._metrics.get("reason") or "OK")
+        face_ok = bool(self._metrics.get("face_detected"))
+        warmup = bool(self._metrics.get("warmup"))
+        calibrated = bool(self._metrics.get("calibrated"))
+        calibration_state = str(self._metrics.get("calibration_state") or "waiting")
+        progress = float(self._metrics.get("calibration_progress") or 0.0)
+        paused = bool(self._metrics.get("paused"))
+        error = str(self._metrics.get("error") or "")
+        perclos = max(0.0, min(1.0, float(self._metrics.get("perclos") or 0.0)))
+        fps = float(self._metrics.get("fps") or 0.0)
+
+        painter.fillRect(0, 0, width, top_h, QColor(0, 0, 0, 150))
+        painter.setFont(QFont("DejaVu Sans", 8 if tiny else (9 if compact else 11), QFont.Bold))
+        painter.setPen(QColor("#ffffff"))
+        timestamp = time.strftime("%H:%M:%S") if tiny else time.strftime("%Y-%m-%d  %H:%M:%S")
+        painter.drawText(QRect(margin, 0, width - 82, top_h), Qt.AlignVCenter | Qt.AlignLeft, timestamp)
+        painter.setPen(QColor(P["red"]))
+        rec_w = 46 if tiny else (54 if compact else 66)
+        painter.drawText(QRect(width - rec_w - margin, 0, rec_w, top_h), Qt.AlignVCenter | Qt.AlignRight, "REC")
+
+        if error:
+            status = "Error"
+            color = QColor(P["red"])
+            right_text = "--"
+        elif not calibrated:
+            status = "CAL" if tiny else "Calibrate"
+            color = QColor(P["dimmer"])
+            right_text = f"{progress * 100:.0f}%"
+        elif not face_ok:
+            status = "NO FACE" if tiny else "No face"
+            color = QColor(P["amber"])
+            right_text = "--"
+        elif warmup:
+            status = "WAIT" if tiny else "Warming up"
+            color = QColor(P["dimmer"])
+            right_text = "--"
+        elif label == 1:
+            status = "ALERT" if tiny else reason
+            color = QColor(P["red"])
+            right_text = f"PERCLOS {perclos * 100:.0f}%"
+        else:
+            status = "OK" if tiny else "Driver alert"
+            color = QColor(P["green"])
+            right_text = f"PERCLOS {perclos * 100:.0f}%"
+
+        painter.fillRect(0, height - bottom_h, width, bottom_h, QColor(0, 0, 0, 165))
+        painter.setFont(QFont("DejaVu Sans", 11 if tiny else (12 if compact else 17), QFont.Bold))
+        painter.setPen(color)
+        right_w = 74 if tiny else (112 if compact else 150)
+        status_rect = QRect(margin, height - bottom_h + 2, width - (2 * margin) - right_w - 12, bottom_h - 12)
+        painter.drawText(status_rect, Qt.AlignVCenter | Qt.AlignLeft, status)
+
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("DejaVu Sans", 9 if tiny else (10 if compact else 13), QFont.Bold))
+        right_rect = QRect(width - right_w - margin, height - bottom_h + 2, right_w, bottom_h - 12)
+        painter.drawText(right_rect, Qt.AlignVCenter | Qt.AlignRight, right_text)
+
+        bar_x = margin
+        bar_w = max(80, width - (2 * margin) - right_w - 18)
+        bar_y = height - 8 if tiny else (height - 12 if compact else height - 16)
+        bar_h = 4 if tiny else (5 if compact else 7)
+        painter.fillRect(bar_x, bar_y, bar_w, bar_h, QColor(90, 90, 90, 170))
+        fill = progress if not calibrated else perclos
+        if not calibrated or face_ok:
+            painter.fillRect(bar_x, bar_y, int(bar_w * max(0.0, min(1.0, fill))), bar_h, color)
+
+        if not tiny:
+            small = f"FPS {fps:.0f}   Face {'yes' if face_ok else 'no'}"
+            if not compact:
+                small += (
+                    f"   EAR {float(self._metrics.get('ear') or 0.0):.3f}"
+                    f"   MAR {float(self._metrics.get('mar') or 0.0):.3f}"
+                    f"   dPose {float(self._metrics.get('pitch_delta') or 0.0):+.0f}/"
+                    f"{float(self._metrics.get('yaw_delta') or 0.0):+.0f}/"
+                    f"{float(self._metrics.get('roll_delta') or 0.0):+.0f}"
+                )
+            painter.setFont(QFont("DejaVu Sans", 8 if compact else 10))
+            painter.setPen(QColor(P["dim"]))
+            painter.drawText(margin, height - bottom_h + (12 if compact else 17), small)
+
+        if error:
+            err_h = 34 if compact else 46
+            err_y = top_h + 8
+            painter.fillRect(0, err_y, width, err_h, QColor(120, 0, 0, 210))
+            painter.setFont(QFont("DejaVu Sans", 10 if compact else 13, QFont.Bold))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(QRect(margin, err_y, width - 2 * margin, err_h), Qt.AlignVCenter | Qt.AlignLeft, error)
+
+        if paused:
+            pause_h = 44 if compact else 64
+            pause_y = max(top_h + 6, height // 2 - pause_h // 2)
+            painter.fillRect(0, pause_y, width, pause_h, QColor(0, 0, 0, 185))
+            painter.setFont(QFont("DejaVu Sans", 16 if compact else 24, QFont.Bold))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(QRect(0, pause_y, width, pause_h), Qt.AlignCenter, "PAUSED")
+
+        if not calibrated:
+            self._draw_calibration_overlay(
+                painter, width, height, compact, tiny, face_ok,
+                calibration_state, progress,
+            )
+
+        painter.end()
+
+    def _draw_calibration_overlay(self, painter, width, height, compact, tiny, face_ok, state, progress):
+        painter.fillRect(0, 0, width, height, QColor(0, 0, 0, 150))
+        panel_w = min(width - 28, 420 if not compact else 320)
+        panel_h = 170 if not tiny else 132
+        panel_x = max(14, (width - panel_w) // 2)
+        panel_y = max(38, (height - panel_h) // 2)
+        panel = QRect(panel_x, panel_y, panel_w, panel_h)
+        painter.fillRect(panel, QColor(10, 10, 10, 215))
+
+        title = "CALIBRATE" if tiny else "Calibrate Driver"
+        painter.setFont(QFont("DejaVu Sans", 15 if tiny else 20, QFont.Bold))
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRect(panel_x, panel_y + 14, panel_w, 34), Qt.AlignCenter, title)
+
+        if state == "waiting":
+            message = "Face forward, eyes open"
+        elif state == "no_face":
+            message = "Face not found"
+        else:
+            message = "Hold still"
+        painter.setFont(QFont("DejaVu Sans", 9 if tiny else 12, QFont.Bold))
+        painter.setPen(QColor(P["green"] if face_ok else P["amber"]))
+        painter.drawText(QRect(panel_x + 10, panel_y + 50, panel_w - 20, 28), Qt.AlignCenter, message)
+
+        button_w = min(panel_w - 36, 300)
+        button_h = 42 if tiny else 50
+        button_x = panel_x + (panel_w - button_w) // 2
+        button_y = panel_y + panel_h - button_h - 18
+        button = QRect(button_x, button_y, button_w, button_h)
+
+        if state == "waiting":
+            self._calibrate_rect = button
+            painter.fillRect(button, QColor(P["green"]))
+            painter.setFont(QFont("DejaVu Sans", 12 if tiny else 15, QFont.Bold))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(button, Qt.AlignCenter, "START")
+            return
+
+        self._calibrate_rect = QRect()
+        bar = QRect(button_x, button_y + button_h // 2 - 4, button_w, 8)
+        clamped = max(0.0, min(1.0, progress))
+        painter.fillRect(bar, QColor(80, 80, 80, 220))
+        painter.fillRect(bar.x(), bar.y(), int(bar.width() * clamped), bar.height(), QColor(P["green"]))
+        painter.setFont(QFont("DejaVu Sans", 10 if tiny else 12, QFont.Bold))
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRect(button_x, button_y - 18, button_w, 18), Qt.AlignCenter, f"{int(clamped * 100)}%")
+
+    def mousePressEvent(self, event):
+        if self._calibrate_rect.isValid() and self._calibrate_rect.contains(event.pos()):
+            self.calibration_requested.emit()
+            return
+        super().mousePressEvent(event)
+
+
+GLOBAL_QSS = f"""
+QMainWindow, QWidget {{
+    background: #000000;
+    color: {P['white']};
+    font-family: 'DejaVu Sans', Arial, sans-serif;
+}}
+"""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self._paused = False
+        self._last_error = ""
+        self._last_audio_calibration_state = None
+        self._last_audio_calibrated = False
+        self._last_audio_face_ok = None
+        self._last_audio_label = None
+        self.audio = AudioNotifier(
+            enabled=not getattr(args, "mute_audio", False),
+            alert_interval=getattr(args, "audio_alert_interval", 8.0),
+            engine=getattr(args, "audio_engine", "piper"),
+            voice=getattr(args, "audio_voice", None),
+            rate=getattr(args, "audio_rate", 132),
+        )
+        self.setStyleSheet(GLOBAL_QSS)
+        self.setWindowTitle("Rule-Based Dashcam")
+        self._build_ui()
+        self._start_worker()
+        QTimer.singleShot(700, self._play_startup_instruction)
+
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(1000)
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.cam_widget = CameraWidget()
+        self.cam_widget.calibration_requested.connect(self._start_calibration)
+        root.addWidget(self.cam_widget)
+
+    def _play_startup_instruction(self):
+        if getattr(self.args, "auto_calibrate", False):
+            self.audio.say("Calibrating. Please face forward and hold still.", key="startup")
+        else:
+            self.audio.say(
+                "Please face forward, then tap start.",
+                key="cal_wait",
+                min_interval=12.0,
+            )
+
+    def _start_worker(self):
+        self.worker = RuleWorker(self.args)
+        self.worker.signals.frame_ready.connect(self._on_frame)
+        self.worker.signals.error.connect(self._on_error)
+        self.worker.start()
+
+    def _start_calibration(self):
+        self._last_error = ""
+        if hasattr(self.worker, "start_calibration"):
+            self.worker.start_calibration()
+        self.audio.say("Calibrating. Please hold still.", key="cal_start", min_interval=2.0)
+        metrics = dict(self.cam_widget._metrics)
+        metrics.update({
+            "label": None,
+            "reason": "CALIBRATING",
+            "calibrated": False,
+            "calibration_state": "calibrating",
+            "calibration_progress": 0.0,
+            "warmup": True,
+        })
+        self.cam_widget.set_metrics(metrics)
+
+    def _on_frame(self, frame, metrics):
+        self.cam_widget.set_frame(frame)
+        metrics = dict(metrics)
+        metrics["paused"] = self._paused
+        if self._last_error:
+            metrics["error"] = self._last_error
+        self.cam_widget.set_metrics(metrics)
+        self._handle_audio(metrics)
+
+    def _handle_audio(self, metrics):
+        if self._paused:
+            return
+
+        calibrated = bool(metrics.get("calibrated"))
+        calibration_state = str(metrics.get("calibration_state") or "waiting")
+        face_ok = bool(metrics.get("face_detected"))
+        warmup = bool(metrics.get("warmup"))
+        label = metrics.get("label")
+
+        if not calibrated:
+            if calibration_state != self._last_audio_calibration_state:
+                if calibration_state == "waiting":
+                    self.audio.say(
+                        "Please face forward, then tap start.",
+                        key="cal_wait",
+                        min_interval=12.0,
+                    )
+                elif calibration_state == "calibrating":
+                    self.audio.say(
+                        "Hold still.",
+                        key="cal_active",
+                        min_interval=5.0,
+                    )
+                elif calibration_state == "no_face":
+                    self.audio.say(
+                        "Driver not visible.",
+                        key="cal_no_face",
+                        min_interval=4.0,
+                    )
+            elif calibration_state == "no_face":
+                self.audio.say(
+                    "Driver not visible.",
+                    key="cal_no_face",
+                    min_interval=6.0,
+                )
+            self._last_audio_calibration_state = calibration_state
+            self._last_audio_calibrated = False
+            return
+
+        if calibrated and not self._last_audio_calibrated:
+            self.audio.say("Calibration complete. Monitoring active.", key="cal_done")
+        self._last_audio_calibrated = True
+        self._last_audio_calibration_state = calibration_state
+
+        if not face_ok:
+            self.audio.say(
+                "Driver not visible.",
+                key="no_face",
+                min_interval=7.0,
+            )
+            self._last_audio_face_ok = False
+            self._last_audio_label = None
+            return
+
+        if self._last_audio_face_ok is False:
+            self.audio.say("Driver visible. Monitoring resumed.", key="face_back", min_interval=5.0)
+        self._last_audio_face_ok = True
+
+        if label == 1 and not warmup:
+            self.audio.say(
+                "Attention. Drowsiness detected.",
+                key="drowsy_alert",
+                min_interval=self.audio.alert_interval,
+                warning_tone=True,
+            )
+        elif label == 0 and self._last_audio_label == 1:
+            self.audio.say("Driver alert.", key="alert_clear", min_interval=5.0)
+        self._last_audio_label = label
+
+    def _on_error(self, message):
+        self._last_error = message[:100]
+        self.audio.say("System alert.", key="system_error", min_interval=10.0)
+        metrics = dict(self.cam_widget._metrics)
+        metrics.update({
+            "label": None,
+            "reason": "Error",
+            "face_detected": False,
+            "paused": self._paused,
+            "error": self._last_error,
+        })
+        self.cam_widget.set_metrics(metrics)
+
+    def _toggle_pause(self):
+        self._paused = not self._paused
+        if self._paused:
+            self.worker.pause()
+            self.audio.say("Paused.", key="paused")
+        else:
+            self.worker.resume()
+            self.audio.say("Resumed.", key="resumed")
+        metrics = dict(self.cam_widget._metrics)
+        metrics["paused"] = self._paused
+        self.cam_widget.set_metrics(metrics)
+
+    def _tick_clock(self):
+        self.cam_widget.update()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Q, Qt.Key_Escape):
+            self.close()
+        elif key in (Qt.Key_Space, Qt.Key_P):
+            self._toggle_pause()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if hasattr(self, "worker"):
+            self.worker.stop()
+        event.accept()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Rule-based drowsiness detector")
+    parser = argparse.ArgumentParser(description="Rule-based dashcam UI")
     parser.add_argument("--source", default="0", help="Picamera2 index or video file path")
     parser.add_argument("--camera-width", type=int, default=640, help="Picamera2 capture width")
     parser.add_argument("--camera-height", type=int, default=480, help="Picamera2 capture height")
@@ -457,12 +1296,47 @@ def parse_args():
     parser.add_argument("--eye-closed-seconds", type=float, default=1.5, help="Continuous eye closure trigger")
     parser.add_argument("--yawn-seconds", type=float, default=1.0, help="Continuous yawn trigger")
     parser.add_argument("--pose-seconds", type=float, default=1.2, help="Continuous bad head-pose trigger")
-    parser.add_argument("--pitch-threshold", type=float, default=28.0, help="Absolute pitch threshold in degrees")
-    parser.add_argument("--yaw-threshold", type=float, default=38.0, help="Absolute yaw threshold in degrees")
-    parser.add_argument("--roll-threshold", type=float, default=35.0, help="Absolute roll threshold in degrees")
+    parser.add_argument("--pose-calibration-seconds", type=float, default=2.0,
+                        help="Seconds used to learn neutral head pose after START")
+    parser.add_argument("--pitch-threshold", type=float, default=28.0, help="Relative pitch threshold in degrees")
+    parser.add_argument("--yaw-threshold", type=float, default=38.0, help="Relative yaw threshold in degrees")
+    parser.add_argument("--roll-threshold", type=float, default=35.0, help="Relative roll threshold in degrees")
     parser.add_argument("--no-face-reset", type=float, default=0.5, help="Seconds without face before clearing state")
+    parser.add_argument("--auto-calibrate", action="store_true",
+                        help="Start head-pose calibration immediately without tapping START")
+    parser.add_argument("--mute-audio", action="store_true",
+                        help="Disable voice prompts and drowsiness warning tone")
+    parser.add_argument("--audio-alert-interval", type=float, default=8.0,
+                        help="Minimum seconds between repeated drowsiness audio alerts")
+    parser.add_argument("--audio-engine", default="piper",
+                        choices=["auto", "piper", "flite", "espeak-ng", "espeak", "say", "spd-say"],
+                        help="Voice prompt engine. Default uses Piper neural TTS")
+    parser.add_argument("--audio-voice", default=None,
+                        help=("Optional voice. For Piper, pass a .onnx voice model path; "
+                              "for espeak-ng, use names like 'en-us+f4'."))
+    parser.add_argument("--piper-model", dest="audio_voice", default=None,
+                        help="Alias for --audio-voice when using Piper")
+    parser.add_argument("--audio-rate", type=int, default=132,
+                        help="Voice speaking rate for espeak/say engines")
+    parser.add_argument("--qt-platform", default=None,
+                        choices=["xcb", "wayland", "eglfs", "linuxfb", "offscreen", "minimal"],
+                        help="Override Qt platform plugin if auto-detection is wrong")
+    parser.add_argument("--no-fullscreen", action="store_true", help="Run in a window instead of full screen")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    args = parse_args()
+    configure_qt_environment(args.qt_platform)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Rule-Based Dashcam")
+
+    window = MainWindow(args)
+    if args.no_fullscreen:
+        window.resize(1024, 600)
+        window.show()
+    else:
+        window.showFullScreen()
+
+    sys.exit(app.exec_())
