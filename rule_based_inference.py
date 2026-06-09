@@ -672,8 +672,19 @@ def draw_feature_overlay(frame, measurements, rule):
         origin = np.float64([(0.0, 0.0, 0.0)])
         origin_2d, _ = cv2.projectPoints(origin, rvec, tvec, camera, DIST_COEFFS)
         axis_2d, _ = cv2.projectPoints(axis, rvec, tvec, camera, DIST_COEFFS)
-        start = tuple(np.round(origin_2d.reshape(-1, 2)[0]).astype(int))
-        x_axis, y_axis, z_axis = [tuple(np.round(p).astype(int)) for p in axis_2d.reshape(-1, 2)]
+        origin_pt = origin_2d.reshape(-1, 2)[0]
+        axis_pts = axis_2d.reshape(-1, 2)
+        nose_pt = np.array(nose, dtype=np.float64)
+        anchored_pts = nose_pt + (axis_pts - origin_pt)
+
+        def clipped_axis_point(point):
+            return (
+                int(np.clip(round(float(point[0])), 0, width - 1)),
+                int(np.clip(round(float(point[1])), 0, height - 1)),
+            )
+
+        start = nose
+        x_axis, y_axis, z_axis = [clipped_axis_point(p) for p in anchored_pts]
         cv2.arrowedLine(frame, start, x_axis, (0, 0, 255), thickness + 1, cv2.LINE_AA, tipLength=0.25)
         cv2.arrowedLine(frame, start, y_axis, (0, 220, 80), thickness + 1, cv2.LINE_AA, tipLength=0.25)
         cv2.arrowedLine(frame, start, z_axis, pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
