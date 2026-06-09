@@ -67,6 +67,7 @@ MOUTH_LEFT, MOUTH_RIGHT = 61, 291
 MOUTH_UPPER = [82, 13, 312]
 MOUTH_LOWER = [87, 14, 317]
 POSE_LM_IDS = [1, 152, 263, 33, 61, 291]
+MOUTH_OUTLINE = [61, 82, 13, 312, 291, 317, 14, 87]
 
 MODEL_3D = np.array([
     (0.0, 0.0, 0.0),
@@ -552,14 +553,14 @@ def compute_mar(lm):
     return v / (3.0 * h)
 
 
-def compute_head_pose(lm, width, height):
+def solve_head_pose(lm, width, height):
     pts = np.array([lm[i] for i in POSE_LM_IDS], dtype=np.float64)
     focal = float(width)
     camera = np.array(
         [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
-    ok, rvec, _ = cv2.solvePnP(
+    ok, rvec, tvec = cv2.solvePnP(
         MODEL_3D,
         pts,
         camera,
@@ -567,7 +568,7 @@ def compute_head_pose(lm, width, height):
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
     if not ok:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, None, None, camera
     rot, _ = cv2.Rodrigues(rvec)
     sy = np.sqrt(rot[0, 0] ** 2 + rot[1, 0] ** 2)
     if sy > 1e-6:
@@ -578,7 +579,12 @@ def compute_head_pose(lm, width, height):
         pitch = np.degrees(np.arctan2(-rot[1, 2], rot[1, 1]))
         yaw = np.degrees(np.arctan2(-rot[2, 0], sy))
         roll = 0.0
-    return float(pitch), float(yaw), float(roll)
+    return float(pitch), float(yaw), float(roll), rvec, tvec, camera
+
+
+def compute_head_pose(lm, width, height):
+    pitch, yaw, roll, _, _, _ = solve_head_pose(lm, width, height)
+    return pitch, yaw, roll
 
 
 def extract_measurements(face_landmarks, width, height):
@@ -587,7 +593,7 @@ def extract_measurements(face_landmarks, width, height):
     ear_r = compute_ear(lm, RIGHT_EYE)
     ear = (ear_l + ear_r) / 2.0
     mar = compute_mar(lm)
-    pitch, yaw, roll = compute_head_pose(lm, width, height)
+    pitch, yaw, roll, rvec, tvec, camera = solve_head_pose(lm, width, height)
     return {
         "ear_l": ear_l,
         "ear_r": ear_r,
@@ -596,7 +602,103 @@ def extract_measurements(face_landmarks, width, height):
         "pitch": pitch,
         "yaw": yaw,
         "roll": roll,
+        "landmarks": lm,
+        "pose_rvec": rvec,
+        "pose_tvec": tvec,
+        "pose_camera": camera,
     }
+
+
+def _pixel_point(lm, idx, width, height):
+    x = int(np.clip(round(float(lm[idx][0])), 0, width - 1))
+    y = int(np.clip(round(float(lm[idx][1])), 0, height - 1))
+    return x, y
+
+
+def _draw_landmark_group(frame, lm, indexes, color, closed=True, thickness=2):
+    height, width = frame.shape[:2]
+    pts = np.array([_pixel_point(lm, idx, width, height) for idx in indexes], dtype=np.int32)
+    if len(pts) >= 2:
+        cv2.polylines(frame, [pts.reshape((-1, 1, 2))], closed, color, thickness, cv2.LINE_AA)
+    for point in pts:
+        cv2.circle(frame, tuple(point), max(2, thickness + 1), color, -1, cv2.LINE_AA)
+
+
+def draw_feature_overlay(frame, measurements, rule):
+    lm = measurements.get("landmarks")
+    if lm is None:
+        return frame
+
+    height, width = frame.shape[:2]
+    closed = bool(rule.get("closed"))
+    yawn = bool(rule.get("yawn"))
+    bad_pose = bool(rule.get("bad_pose"))
+
+    eye_color = (0, 0, 255) if closed else (0, 220, 80)
+    mouth_color = (0, 0, 255) if yawn else (0, 200, 255)
+    pose_color = (0, 0, 255) if bad_pose else (255, 200, 0)
+    thickness = max(1, round(min(width, height) / 320))
+
+    for eye in (LEFT_EYE, RIGHT_EYE):
+        _draw_landmark_group(frame, lm, eye, eye_color, closed=True, thickness=thickness)
+        p0 = _pixel_point(lm, eye[0], width, height)
+        p3 = _pixel_point(lm, eye[3], width, height)
+        p15 = _pixel_point(lm, eye[1], width, height)
+        p54 = _pixel_point(lm, eye[5], width, height)
+        p24 = _pixel_point(lm, eye[2], width, height)
+        p42 = _pixel_point(lm, eye[4], width, height)
+        cv2.line(frame, p0, p3, eye_color, thickness, cv2.LINE_AA)
+        cv2.line(frame, p15, p54, eye_color, thickness, cv2.LINE_AA)
+        cv2.line(frame, p24, p42, eye_color, thickness, cv2.LINE_AA)
+
+    _draw_landmark_group(frame, lm, MOUTH_OUTLINE, mouth_color, closed=True, thickness=thickness)
+    cv2.line(frame, _pixel_point(lm, MOUTH_LEFT, width, height), _pixel_point(lm, MOUTH_RIGHT, width, height),
+             mouth_color, thickness, cv2.LINE_AA)
+    for upper, lower in zip(MOUTH_UPPER, MOUTH_LOWER):
+        cv2.line(frame, _pixel_point(lm, upper, width, height), _pixel_point(lm, lower, width, height),
+                 mouth_color, thickness, cv2.LINE_AA)
+
+    nose = _pixel_point(lm, 1, width, height)
+    rvec = measurements.get("pose_rvec")
+    tvec = measurements.get("pose_tvec")
+    camera = measurements.get("pose_camera")
+    if rvec is not None and tvec is not None and camera is not None:
+        axis_len = max(35.0, min(width, height) * 0.12)
+        axis = np.float64([
+            (axis_len, 0.0, 0.0),
+            (0.0, axis_len, 0.0),
+            (0.0, 0.0, axis_len),
+        ])
+        origin = np.float64([(0.0, 0.0, 0.0)])
+        origin_2d, _ = cv2.projectPoints(origin, rvec, tvec, camera, DIST_COEFFS)
+        axis_2d, _ = cv2.projectPoints(axis, rvec, tvec, camera, DIST_COEFFS)
+        start = tuple(np.round(origin_2d.reshape(-1, 2)[0]).astype(int))
+        x_axis, y_axis, z_axis = [tuple(np.round(p).astype(int)) for p in axis_2d.reshape(-1, 2)]
+        cv2.arrowedLine(frame, start, x_axis, (0, 0, 255), thickness + 1, cv2.LINE_AA, tipLength=0.25)
+        cv2.arrowedLine(frame, start, y_axis, (0, 220, 80), thickness + 1, cv2.LINE_AA, tipLength=0.25)
+        cv2.arrowedLine(frame, start, z_axis, pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
+    else:
+        yaw = float(measurements.get("yaw", 0.0))
+        pitch = float(measurements.get("pitch", 0.0))
+        end = (
+            int(np.clip(nose[0] + yaw * 2.0, 0, width - 1)),
+            int(np.clip(nose[1] - pitch * 2.0, 0, height - 1)),
+        )
+        cv2.arrowedLine(frame, nose, end, pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
+
+    text = (
+        f"EAR {float(measurements.get('ear', 0.0)):.2f}  "
+        f"MAR {float(measurements.get('mar', 0.0)):.2f}  "
+        f"P/Y/R {float(measurements.get('pitch', 0.0)):+.0f}/"
+        f"{float(measurements.get('yaw', 0.0)):+.0f}/"
+        f"{float(measurements.get('roll', 0.0)):+.0f}"
+    )
+    label_anchor = _pixel_point(lm, 10, width, height)
+    text_x_max = max(6, width - 220)
+    text_pos = (int(np.clip(label_anchor[0] - 90, 6, text_x_max)), max(24, label_anchor[1] - 20))
+    cv2.putText(frame, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(frame, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), thickness + 1, cv2.LINE_AA)
+    return frame
 
 
 def camera_index(source):
@@ -950,6 +1052,9 @@ class RuleWorker(QThread):
                     rule = state.update(measurements, True)
                 else:
                     rule = state.update(None, False)
+
+                if face_ok and not getattr(self.args, "hide_face_overlay", False):
+                    draw_feature_overlay(frame, measurements, rule)
 
                 metrics = {
                     "label": rule["label"],
@@ -1429,6 +1534,8 @@ def parse_args():
     parser.add_argument("--yaw-threshold", type=float, default=38.0, help="Relative yaw threshold in degrees")
     parser.add_argument("--roll-threshold", type=float, default=35.0, help="Relative roll threshold in degrees")
     parser.add_argument("--no-face-reset", type=float, default=0.5, help="Seconds without face before clearing state")
+    parser.add_argument("--hide-face-overlay", action="store_true",
+                        help="Hide EAR/MAR landmarks and head-pose axes on the camera feed")
     parser.add_argument("--auto-calibrate", action="store_true",
                         help="Start head-pose calibration immediately without tapping START")
     parser.add_argument("--mute-audio", action="store_true",
