@@ -538,6 +538,27 @@ def _dist(a, b):
     return float(np.sqrt(dx * dx + dy * dy))
 
 
+def wrap_angle_deg(value):
+    wrapped = (np.asarray(value, dtype=np.float64) + 180.0) % 360.0 - 180.0
+    if wrapped.shape == ():
+        return float(wrapped)
+    return wrapped
+
+
+def circular_mean_deg(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
+    radians = np.deg2rad(arr)
+    mean_sin = np.mean(np.sin(radians), axis=0)
+    mean_cos = np.mean(np.cos(radians), axis=0)
+    return wrap_angle_deg(np.rad2deg(np.arctan2(mean_sin, mean_cos)))
+
+
+def angle_delta_deg(value, baseline):
+    return wrap_angle_deg(float(value) - float(baseline))
+
+
 def compute_ear(lm, eye_idx):
     v1 = _dist(lm[eye_idx[1]], lm[eye_idx[5]])
     v2 = _dist(lm[eye_idx[2]], lm[eye_idx[4]])
@@ -700,9 +721,9 @@ def draw_feature_overlay(frame, measurements, rule):
     text = (
         f"EAR {float(measurements.get('ear', 0.0)):.2f}  "
         f"MAR {float(measurements.get('mar', 0.0)):.2f}  "
-        f"P/Y/R {float(measurements.get('pitch', 0.0)):+.0f}/"
-        f"{float(measurements.get('yaw', 0.0)):+.0f}/"
-        f"{float(measurements.get('roll', 0.0)):+.0f}"
+        f"dP/Y/R {float(rule.get('pitch_delta') or 0.0):+.0f}/"
+        f"{float(rule.get('yaw_delta') or 0.0):+.0f}/"
+        f"{float(rule.get('roll_delta') or 0.0):+.0f}"
     )
     label_anchor = _pixel_point(lm, 10, width, height)
     text_x_max = max(6, width - 220)
@@ -833,7 +854,7 @@ class RuleState:
             return True
         self.pose_samples.append([measurements["pitch"], measurements["yaw"], measurements["roll"]])
         if len(self.pose_samples) >= self.calibration_required:
-            self.pose_baseline = np.median(np.array(self.pose_samples, dtype=np.float32), axis=0)
+            self.pose_baseline = circular_mean_deg(np.array(self.pose_samples, dtype=np.float32))
             return True
         return False
 
@@ -897,13 +918,13 @@ class RuleState:
         ear = measurements["ear"]
         mar = measurements["mar"]
         if self.pose_baseline is None:
-            pitch_delta = measurements["pitch"]
-            yaw_delta = measurements["yaw"]
-            roll_delta = measurements["roll"]
+            pitch_delta = wrap_angle_deg(measurements["pitch"])
+            yaw_delta = wrap_angle_deg(measurements["yaw"])
+            roll_delta = wrap_angle_deg(measurements["roll"])
         else:
-            pitch_delta = measurements["pitch"] - float(self.pose_baseline[0])
-            yaw_delta = measurements["yaw"] - float(self.pose_baseline[1])
-            roll_delta = measurements["roll"] - float(self.pose_baseline[2])
+            pitch_delta = angle_delta_deg(measurements["pitch"], self.pose_baseline[0])
+            yaw_delta = angle_delta_deg(measurements["yaw"], self.pose_baseline[1])
+            roll_delta = angle_delta_deg(measurements["roll"], self.pose_baseline[2])
 
         closed = ear < self.args.ear_threshold
         yawn = mar > self.args.mar_threshold
