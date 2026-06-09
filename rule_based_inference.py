@@ -95,6 +95,21 @@ PIPER_MODEL_CANDIDATES = (
     "en_US-ryan-medium.onnx",
 )
 
+AUDIO_PRELOAD_PHRASES = (
+    "Attention. Drowsiness detected.",
+    "Driver not visible.",
+    "Please face forward, then tap start.",
+    "Calibrating. Please hold still.",
+    "Hold still.",
+    "Calibration complete. Monitoring active.",
+    "Driver visible. Monitoring resumed.",
+    "Driver alert.",
+    "System alert.",
+    "Paused.",
+    "Resumed.",
+    "Calibrating. Please face forward and hold still.",
+)
+
 
 class AudioNotifier:
     """Small non-blocking voice/tone helper matching ui.py."""
@@ -115,6 +130,13 @@ class AudioNotifier:
         self._last_spoken = {}
         self._busy = False
         self._lock = threading.Lock()
+        self._tone_busy = False
+        self._tone_lock = threading.Lock()
+        self._cache_dir = tempfile.TemporaryDirectory(prefix="rule_dashcam_tts_")
+        self._speech_cache = {}
+        self._speech_cache_pending = set()
+        self._cache_lock = threading.Lock()
+        self._synth_lock = threading.Lock()
         self._piper_model = None
         self._piper_config = None
         self._warned = set()
@@ -223,6 +245,104 @@ class AudioNotifier:
                 return [path] + args
         return None
 
+    def preload(self, phrases):
+        if not self.enabled or not self._can_cache_speech():
+            return
+        thread = threading.Thread(
+            target=self._preload_worker,
+            args=(tuple(dict.fromkeys(phrases)),),
+            daemon=True,
+        )
+        thread.start()
+
+    def _preload_worker(self, phrases):
+        for text in phrases:
+            self._ensure_cached_speech(text)
+
+    def _can_cache_speech(self):
+        return (
+            self._speaker is not None and
+            Path(self._speaker).name == "piper" and
+            self._piper_model is not None and
+            self._piper_config is not None
+        )
+
+    def _cached_speech_path(self, text):
+        with self._cache_lock:
+            path = self._speech_cache.get(text)
+        if path and os.path.exists(path):
+            return path
+        return None
+
+    def _ensure_cached_speech(self, text):
+        if not self._can_cache_speech():
+            return None
+
+        cached = self._cached_speech_path(text)
+        if cached:
+            return cached
+
+        with self._cache_lock:
+            if text in self._speech_cache_pending:
+                return None
+            self._speech_cache_pending.add(text)
+
+        try:
+            index = len(self._speech_cache)
+            wav_path = os.path.join(self._cache_dir.name, f"tts_{index:02d}.wav")
+            if self._synthesize_piper_to_file(text, wav_path):
+                with self._cache_lock:
+                    self._speech_cache[text] = wav_path
+                return wav_path
+        finally:
+            with self._cache_lock:
+                self._speech_cache_pending.discard(text)
+        return None
+
+    def _synthesize_piper_to_file(self, text, wav_path):
+        with self._synth_lock:
+            cmd = [
+                self._speaker,
+                "--model", self._piper_model,
+                "--config", self._piper_config,
+                "--output_file", wav_path,
+            ]
+            result = subprocess.run(
+                cmd,
+                input=f"{text}\n".encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+            self._warn_once("piper_run", "Audio: Piper failed to synthesize speech.")
+            return False
+        return True
+
+    def _play_cached_speech_async(self, wav_path):
+        thread = threading.Thread(
+            target=self._play_wav_file,
+            args=(wav_path, 8),
+            daemon=True,
+        )
+        thread.start()
+
+    def _play_wav_file(self, wav_path, timeout=8):
+        player = self._audio_player_cmd(wav_path)
+        if player:
+            result = subprocess.run(
+                player,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+            if result.returncode != 0:
+                self._warn_once("wav_play", "Audio: WAV playback failed.")
+            return
+        self._warn_once("wav_player_runtime", "Audio: No WAV player available for speech output.")
+
     def say(self, text, key=None, min_interval=0.0, warning_tone=False):
         if not self.enabled:
             return
@@ -232,64 +352,70 @@ class AudioNotifier:
         last = self._last_spoken.get(key, -1e9)
         if now - last < float(min_interval):
             return
-        self._last_spoken[key] = now
 
-        if not self._speaker and not warning_tone:
+        tone_started = False
+        if warning_tone:
+            tone_started = self._play_warning_tone_async()
+
+        if not self._speaker:
+            if tone_started or not warning_tone:
+                self._last_spoken[key] = now
             return
 
+        cached_path = self._cached_speech_path(text)
+        if cached_path and warning_tone:
+            self._last_spoken[key] = now
+            self._play_cached_speech_async(cached_path)
+            return
+
+        with self._lock:
+            if self._busy:
+                if tone_started or not warning_tone:
+                    self._last_spoken[key] = now
+                return
+            self._busy = True
+
+        self._last_spoken[key] = now
         thread = threading.Thread(
             target=self._speak,
-            args=(text, warning_tone),
+            args=(text, cached_path),
             daemon=True,
         )
         thread.start()
 
-    def _speak(self, text, warning_tone=False):
-        with self._lock:
-            if self._busy:
-                return
-            self._busy = True
+    def _play_warning_tone_async(self):
+        with self._tone_lock:
+            if self._tone_busy:
+                return False
+            self._tone_busy = True
+
+        thread = threading.Thread(target=self._tone_worker, daemon=True)
+        thread.start()
+        return True
+
+    def _tone_worker(self):
         try:
-            if warning_tone:
-                self._play_warning_tone_blocking()
-            if not self._speaker:
-                return
+            self._play_warning_tone_blocking()
+        finally:
+            with self._tone_lock:
+                self._tone_busy = False
+
+    def _speak(self, text, cached_path=None):
+        if not self._speaker:
+            return
+        try:
             name = Path(self._speaker).name
+            if cached_path:
+                self._play_wav_file(cached_path, timeout=8)
+                return
             if name == "piper":
                 wav_path = None
                 try:
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
                         wav_path = fh.name
-                    cmd = [
-                        self._speaker,
-                        "--model", self._piper_model,
-                        "--config", self._piper_config,
-                        "--output_file", wav_path,
-                    ]
-                    result = subprocess.run(
-                        cmd,
-                        input=f"{text}\n".encode("utf-8"),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                        check=False,
-                    )
-                    if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-                        self._warn_once("piper_run", "Audio: Piper failed to synthesize speech.")
+                    if not self._synthesize_piper_to_file(text, wav_path):
                         return
-                    player = self._audio_player_cmd(wav_path)
-                    if player:
-                        result = subprocess.run(
-                            player,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=8,
-                            check=False,
-                        )
-                        if result.returncode != 0:
-                            self._warn_once("piper_play", "Audio: Piper generated speech, but playback failed.")
-                    else:
-                        self._warn_once("piper_player_runtime", "Audio: No WAV player available for Piper output.")
+                    self._play_wav_file(wav_path, timeout=8)
                 finally:
                     if wav_path:
                         try:
@@ -1102,6 +1228,7 @@ class MainWindow(QMainWindow):
             voice=getattr(args, "audio_voice", None),
             rate=getattr(args, "audio_rate", 132),
         )
+        self.audio.preload(AUDIO_PRELOAD_PHRASES)
         self.setStyleSheet(GLOBAL_QSS)
         self.setWindowTitle("Rule-Based Dashcam")
         self._build_ui()
