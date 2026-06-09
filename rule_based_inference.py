@@ -574,7 +574,29 @@ def compute_mar(lm):
     return v / (3.0 * h)
 
 
-def solve_head_pose(lm, width, height):
+def compute_landmark_head_pose(lm):
+    eye_left = lm[33]
+    eye_right = lm[263]
+    nose = lm[1]
+    chin = lm[152]
+    mouth_center = (lm[MOUTH_LEFT] + lm[MOUTH_RIGHT]) / 2.0
+    eye_center = (eye_left + eye_right) / 2.0
+    eye_width = max(_dist(eye_left, eye_right), 1.0)
+    face_height = max(_dist(eye_center, chin), eye_width)
+
+    face_center = (eye_center * 0.65) + (mouth_center * 0.35)
+    yaw = ((nose[0] - face_center[0]) / eye_width) * 85.0
+    pitch = ((nose[1] - eye_center[1]) / face_height) * 110.0
+    roll = np.degrees(np.arctan2(eye_right[1] - eye_left[1], eye_right[0] - eye_left[0]))
+    roll = wrap_angle_deg(roll)
+    if roll > 90.0:
+        roll -= 180.0
+    elif roll < -90.0:
+        roll += 180.0
+    return float(pitch), float(yaw), float(roll)
+
+
+def solve_pnp_pose(lm, width, height):
     pts = np.array([lm[i] for i in POSE_LM_IDS], dtype=np.float64)
     focal = float(width)
     camera = np.array(
@@ -604,8 +626,7 @@ def solve_head_pose(lm, width, height):
 
 
 def compute_head_pose(lm, width, height):
-    pitch, yaw, roll, _, _, _ = solve_head_pose(lm, width, height)
-    return pitch, yaw, roll
+    return compute_landmark_head_pose(lm)
 
 
 def extract_measurements(face_landmarks, width, height):
@@ -614,7 +635,7 @@ def extract_measurements(face_landmarks, width, height):
     ear_r = compute_ear(lm, RIGHT_EYE)
     ear = (ear_l + ear_r) / 2.0
     mar = compute_mar(lm)
-    pitch, yaw, roll, rvec, tvec, camera = solve_head_pose(lm, width, height)
+    pitch, yaw, roll = compute_landmark_head_pose(lm)
     return {
         "ear_l": ear_l,
         "ear_r": ear_r,
@@ -624,9 +645,6 @@ def extract_measurements(face_landmarks, width, height):
         "yaw": yaw,
         "roll": roll,
         "landmarks": lm,
-        "pose_rvec": rvec,
-        "pose_tvec": tvec,
-        "pose_camera": camera,
     }
 
 
@@ -680,43 +698,28 @@ def draw_feature_overlay(frame, measurements, rule):
                  mouth_color, thickness, cv2.LINE_AA)
 
     nose = _pixel_point(lm, 1, width, height)
-    rvec = measurements.get("pose_rvec")
-    tvec = measurements.get("pose_tvec")
-    camera = measurements.get("pose_camera")
-    if rvec is not None and tvec is not None and camera is not None:
-        axis_len = max(35.0, min(width, height) * 0.12)
-        axis = np.float64([
-            (axis_len, 0.0, 0.0),
-            (0.0, axis_len, 0.0),
-            (0.0, 0.0, axis_len),
-        ])
-        origin = np.float64([(0.0, 0.0, 0.0)])
-        origin_2d, _ = cv2.projectPoints(origin, rvec, tvec, camera, DIST_COEFFS)
-        axis_2d, _ = cv2.projectPoints(axis, rvec, tvec, camera, DIST_COEFFS)
-        origin_pt = origin_2d.reshape(-1, 2)[0]
-        axis_pts = axis_2d.reshape(-1, 2)
-        nose_pt = np.array(nose, dtype=np.float64)
-        anchored_pts = nose_pt + (axis_pts - origin_pt)
+    axis_len = max(35.0, min(width, height) * 0.12)
+    roll = float(measurements.get("roll", 0.0))
+    roll_rad = np.deg2rad(roll)
+    x_vec = np.array([np.cos(roll_rad), np.sin(roll_rad)], dtype=np.float64) * axis_len
+    y_vec = np.array([-np.sin(roll_rad), np.cos(roll_rad)], dtype=np.float64) * axis_len
+    z_vec = np.array([
+        float(rule.get("yaw_delta") or 0.0) * 1.7,
+        float(rule.get("pitch_delta") or 0.0) * 1.7,
+    ], dtype=np.float64)
+    if np.linalg.norm(z_vec) < axis_len * 0.35:
+        z_vec = np.array([0.0, -axis_len * 0.35], dtype=np.float64)
 
-        def clipped_axis_point(point):
-            return (
-                int(np.clip(round(float(point[0])), 0, width - 1)),
-                int(np.clip(round(float(point[1])), 0, height - 1)),
-            )
-
-        start = nose
-        x_axis, y_axis, z_axis = [clipped_axis_point(p) for p in anchored_pts]
-        cv2.arrowedLine(frame, start, x_axis, (0, 0, 255), thickness + 1, cv2.LINE_AA, tipLength=0.25)
-        cv2.arrowedLine(frame, start, y_axis, (0, 220, 80), thickness + 1, cv2.LINE_AA, tipLength=0.25)
-        cv2.arrowedLine(frame, start, z_axis, pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
-    else:
-        yaw = float(measurements.get("yaw", 0.0))
-        pitch = float(measurements.get("pitch", 0.0))
-        end = (
-            int(np.clip(nose[0] + yaw * 2.0, 0, width - 1)),
-            int(np.clip(nose[1] - pitch * 2.0, 0, height - 1)),
+    def clipped_axis_point(offset):
+        point = np.array(nose, dtype=np.float64) + offset
+        return (
+            int(np.clip(round(float(point[0])), 0, width - 1)),
+            int(np.clip(round(float(point[1])), 0, height - 1)),
         )
-        cv2.arrowedLine(frame, nose, end, pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
+
+    cv2.arrowedLine(frame, nose, clipped_axis_point(x_vec), (0, 0, 255), thickness + 1, cv2.LINE_AA, tipLength=0.25)
+    cv2.arrowedLine(frame, nose, clipped_axis_point(y_vec), (0, 220, 80), thickness + 1, cv2.LINE_AA, tipLength=0.25)
+    cv2.arrowedLine(frame, nose, clipped_axis_point(z_vec), pose_color, thickness + 1, cv2.LINE_AA, tipLength=0.25)
 
     text = (
         f"EAR {float(measurements.get('ear', 0.0)):.2f}  "
